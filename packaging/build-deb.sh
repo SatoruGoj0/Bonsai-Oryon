@@ -4,6 +4,7 @@
 # Layout:
 #   /usr/bin/bonsai-{cli,server,bench}        real executables, DT_RPATH=/usr/lib/bonsai-oryon
 #   /usr/lib/bonsai-oryon/bin/bonsai-perplexity  helper for output comparisons (not on $PATH)
+#   /usr/lib/bonsai-oryon/bin/bonsai-diag        memory-bandwidth / GEMV diagnostics (not on $PATH)
 #   /usr/share/bonsai-oryon/                  benchmark / comparison scripts
 #   /usr/lib/bonsai-oryon/                    private libllama/libggml*/libmtmd + CPU variant modules
 #   /usr/share/doc/bonsai-oryon/              README, changelog, copyright, upstream licenses, provenance
@@ -26,6 +27,7 @@ install -m 0755 "${BUILD}/bin/llama-server" "${STAGE}/usr/bin/bonsai-server"
 install -m 0755 "${BUILD}/bin/llama-bench"  "${STAGE}/usr/bin/bonsai-bench"
 # helper tool for numerical comparisons on the target (kept off $PATH) + benchmark scripts
 install -D -m 0755 "${BUILD}/bin/llama-perplexity" "${STAGE}${BONSAI_LIBDIR}/bin/bonsai-perplexity"
+install -D -m 0755 "${BUILD}/bin/bonsai-diag"      "${STAGE}${BONSAI_LIBDIR}/bin/bonsai-diag"
 SHARE="${STAGE}/usr/share/${PKG}"
 install -D -m 0755 "${REPO_ROOT}/bench/bonsai-benchmark.sh"        "${SHARE}/bonsai-benchmark.sh"
 install -D -m 0755 "${REPO_ROOT}/bench/compare-output.sh"          "${SHARE}/compare-output.sh"

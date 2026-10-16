@@ -50,3 +50,12 @@ cmake --build "${OUT}" -j "${JOBS}" --target ${BUILD_TARGETS}
 
 log "built into ${OUT}/bin"
 ls -1 "${OUT}/bin" | sed 's/^/  /' >&2
+
+# bonsai-diag (memory bandwidth + PQ2_0 GEMV diagnostics), linked against this build's shared ggml
+if [ "${BUILD_DIAG:-1}" = 1 ]; then
+    cmake -S "${REPO_ROOT}/tools/diag" -B "${OUT}-diag" "${GEN[@]}" -DCMAKE_BUILD_TYPE=Release \
+        -DLLAMA_SRC="${SRC_DIR}" -DLLAMA_BUILD_DIR="${OUT}" ${CMAKE_EXTRA:-}
+    cmake --build "${OUT}-diag" -j "${JOBS}"
+    cp "${OUT}-diag/bonsai-diag" "${OUT}/bin/bonsai-diag"
+    log "built ${OUT}/bin/bonsai-diag"
+fi

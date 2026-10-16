@@ -4,8 +4,8 @@ name: model-validation (opt-in, real 9B model)
 # (about 2.4 GB) from Hugging Face onto the runner. Nothing is cached, uploaded or redistributed.
 # Justification: the only way to check end-to-end numerical compatibility (KL divergence of
 # full-vocabulary logits) of the optimized kernels against unpatched upstream kernels on the REAL
-# model, and to get a like-for-like A/B (pp256/tg128) on ARM64 hardware. The runner is a generic
-# 4-vCPU Arm Neoverse VM, so these are NOT Snapdragon X numbers.
+# model, and to get like-for-like A/B numbers on ARM64 hardware. The runner is a generic
+# 4-vCPU Arm Neoverse N2 VM, so these are NOT Snapdragon X numbers.
 
 on:
   workflow_dispatch:
@@ -18,13 +18,15 @@ permissions:
   contents: read
   actions: read
 
+env:
+  MODEL_URL: https://huggingface.co/prism-ml/Ternary-Bonsai-2-9B-gguf/resolve/main/Ternary-Bonsai-2-9B-PQ2_0.gguf
+
 jobs:
   validate:
     runs-on: ubuntu-24.04-arm
     container: debian:trixie
     env:
       DEBIAN_FRONTEND: noninteractive
-      MODEL_URL: https://huggingface.co/prism-ml/Ternary-Bonsai-2-9B-gguf/resolve/main/Ternary-Bonsai-2-9B-PQ2_0.gguf
     steps:
       - run: apt-get update -qq && apt-get install -y -qq --no-install-recommends git ca-certificates python3 python3-numpy python3-yaml curl libgomp1
       - uses: actions/checkout@v4
@@ -39,40 +41,94 @@ jobs:
           mkdir -p /models
           curl -fL --retry 5 -o /models/bonsai.gguf "$MODEL_URL"
           ls -la /models; sha256sum /models/bonsai.gguf
-      - name: inspect tensor types
+      - name: inspect tensor types and PQ2_0 code usage (is the checkpoint strictly ternary?)
         continue-on-error: true
         run: |
           mkdir -p results
           python3 - <<'PY' | tee results/model-tensors.md
           import sys, collections
+          import numpy as np
           sys.path.insert(0, "upstream/llama.cpp/gguf-py")
           import gguf
           r = gguf.GGUFReader("/models/bonsai.gguf")
           arch = r.fields["general.architecture"]; print("architecture:", bytes(arch.parts[arch.data[0]]).decode())
           by = collections.defaultdict(lambda: [0, 0])
+          codes = np.zeros(4, dtype=np.int64)
           for t in r.tensors:
               by[t.tensor_type.name][0] += 1; by[t.tensor_type.name][1] += int(t.n_bytes)
+              if t.tensor_type.name == "PQ2_0":
+                  raw = np.asarray(t.data, dtype=np.uint8).reshape(-1, 34)[:, 2:]
+                  for j in range(4):
+                      codes += np.bincount(((raw >> (2 * j)) & 3).ravel(), minlength=4)
           print("| type | tensors | MiB |\n|---|---|---|")
           for k, (n, b) in sorted(by.items(), key=lambda kv: -kv[1][1]): print(f"| {k} | {n} | {b/2**20:.1f} |")
+          tot = codes.sum()
+          print("\nPQ2_0 code histogram (value = code-1):", {f"{c-1:+d}": f"{codes[c]/tot*100:.3f}%" for c in range(4)})
+          print("strictly ternary (no +2 codes):", codes[3] == 0)
           for t in r.tensors:
               if t.name in ("token_embd.weight", "output.weight"): print(f"- {t.name}: {t.tensor_type.name} {list(t.shape)}")
           PY
       - name: numerical compatibility on the real model (KL divergence vs unpatched kernels)
         run: |
           cat upstream/llama.cpp/README.md upstream/llama.cpp/docs/build.md > /tmp/text.txt
-          echo "### real-model numerical compatibility (Ternary-Bonsai-2-9B-PQ2_0)" > results/real-numerics.md
+          echo "### real-model numerical compatibility, v0.2 default kernels vs unpatched e3de715 kernels" > results/real-numerics.md
           BASE_BACKEND_DIR=$PWD/base/bin OPT_BACKEND_DIR=$PWD/opt/bin THREADS=4 CTX=256 CHUNKS=4 MAX_KLD=0.001 MIN_TOP1=98 \
             tests/numerics/compare-kld.sh base/bin/llama-perplexity opt/bin/llama-perplexity /models/bonsai.gguf /tmp/text.txt results/real-numerics.md
-      - name: A/B pp256 / tg128 (runner CPU, 4 threads, 3 reps)
+      - name: A/B on the real model, threads 1/2/4 (runner CPU, 3 reps)
         run: |
-          { echo "### real-model A/B, $(lscpu | sed -n 's/^Model name: *//p' | head -1), $(nproc) vCPU - NOT Snapdragon X"; echo; } > results/real-ab.md
-          for v in base opt; do
-            echo "#### $v" >> results/real-ab.md
-            LD_LIBRARY_PATH=$PWD/$v/bin BONSAI_BACKEND_DIR=$PWD/$v/bin $v/bin/llama-bench -m /models/bonsai.gguf -t 4 -ngl 0 -p 256 -n 128 -r 3 -o md 2>&1 | grep -E '^\|' | tee -a results/real-ab.md
-            echo >> results/real-ab.md
-          done
+          R=results/real-ab.md
+          { echo "### real-model A/B, $(lscpu | sed -n 's/^Model name: *//p' | head -1), $(nproc) vCPU - NOT Snapdragon X"; echo
+            echo "| build | threads | pp256 tok/s | tg128 tok/s |"; echo "|---|---|---|---|"; } > $R
+          ab() { # label dir env...
+            l=$1; d=$2; shift 2
+            env "$@" LD_LIBRARY_PATH=$PWD/$d/bin BONSAI_BACKEND_DIR=$PWD/$d/bin $d/bin/llama-bench -m /models/bonsai.gguf \
+              -t 1,2,4 -ngl 0 -p 256 -n 128 -r 3 -o json > /tmp/$l.json 2>/tmp/$l.log || { tail /tmp/$l.log; return 1; }
+            python3 - /tmp/$l.json "$l" >> $R <<'PY'
+          import json, sys
+          rows = {}
+          for r in json.load(open(sys.argv[1])):
+              rows.setdefault(r["n_threads"], {})["pp" if r["n_prompt"] else "tg"] = "%.2f ± %.2f" % (r["avg_ts"], r["stddev_ts"])
+          for t in sorted(rows): print(f"| {sys.argv[2]} | {t} | {rows[t].get('pp')} | {rows[t].get('tg')} |")
+          PY
+          }
+          ab "upstream kernels (e3de715 + 0003/0004)" base
+          ab "v0.1 path (BONSAI_PQ2_REPACK=0)" opt BONSAI_PQ2_REPACK=0
+          ab "v0.2 4-row layout (default)" opt
+          cat $R
       - if: always()
         run: cat results/*.md >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         if: always()
         with: { name: real-model-results, path: results/ }
+
+  profile:
+    name: perf profile of token generation (runner CPU)
+    runs-on: ubuntu-24.04-arm
+    continue-on-error: true
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: engine-bin, run-id: '${{ inputs.ci_run_id }}', github-token: '${{ github.token }}' }
+      - run: mkdir -p opt && tar -C opt -xzf engine-bin.tgz
+      - run: curl -fL --retry 5 -o model.gguf "$MODEL_URL"
+      - name: perf record tg (v0.2 default and v0.1 path)
+        run: |
+          sudo sysctl -w kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0
+          cat > prof.sh <<'EOF'
+          set -e
+          apt-get update -qq && apt-get install -y -qq --no-install-recommends linux-perf libgomp1 >/dev/null
+          export LD_LIBRARY_PATH=/w/opt/bin BONSAI_BACKEND_DIR=/w/opt/bin
+          for v in v02:1 v01:0; do
+            n=${v%%:*}; BONSAI_PQ2_REPACK=${v#*:} perf record -q -F 1999 -o /w/$n.data -- \
+              /w/opt/bin/llama-bench -m /w/model.gguf -t 4 -ngl 0 -p 0 -n 64 -r 1 >/w/$n.bench 2>&1
+            echo "### $n (BONSAI_PQ2_REPACK=${v#*:}): top symbols, tg64, 4 threads"
+            grep -E '^\|' /w/$n.bench | tail -1
+            echo '```'
+            perf report -q -i /w/$n.data --no-children --sort symbol --stdio 2>/dev/null | grep -v '^$' | head -30
+            echo '```'
+          done
+          EOF
+          docker run --rm --privileged -v "$PWD:/w" -w /w debian:trixie bash /w/prof.sh | tee profile.md
+          cat profile.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: tg-profile, path: profile.md }

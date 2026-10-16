@@ -1,5 +1,5 @@
 # Shared settings for Bonsai-Oryon scripts (sourced, not executed).
-BONSAI_VERSION="0.1.0"
+BONSAI_VERSION="0.2.0"
 UPSTREAM_URL="https://github.com/PrismML-Eng/llama.cpp.git"
 UPSTREAM_BRANCH="prism"
 UPSTREAM_COMMIT="e3de715222b2667c54a267441159a5729f11155e"
