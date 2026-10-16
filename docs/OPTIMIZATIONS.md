@@ -106,6 +106,32 @@ When `GGML_BACKEND_DIR` is set (the package sets it to `/usr/lib/bonsai-oryon`),
 llama.cpp build directory can therefore never load that build's `libggml-vulkan.so`. Tests can set
 `BONSAI_BACKEND_DIR` to point a build tree at its own modules.
 
+## 2b. End-to-end measurement (CI hardware, not Snapdragon X)
+
+Real model, `Ternary-Bonsai-2-9B-PQ2_0.gguf` (arch `qwen35`, 8.95 B params, every weight tensor PQ2_0
+including the 248k-vocabulary embedding and output head). GitHub `ubuntu-24.04-arm` runner: Arm
+Neoverse N2, 4 vCPU, `-t 4 -ngl 0 -p 256 -n 128 -r 3`, same machine, same CPU module (`armv8.6_2`),
+run back to back
+([model-validation run](https://github.com/SatoruGoj0/Bonsai-Oryon/actions/runs/38889641006)):
+
+| build | pp256 tok/s | tg128 tok/s |
+|---|---|---|
+| pinned upstream kernels (patches 0003+0004 only) | 8.95 ± 0.01 | 6.73 ± 0.06 |
+| Bonsai Oryon (all patches) | **13.80 ± 0.01** (+54%) | **7.82 ± 0.01** (+16%) |
+
+Output compatibility on the same model, full-vocabulary logits against the unpatched kernels over
+1024 tokens: mean KL divergence 5.2e-4 (threshold 1e-3), PPL ratio 1.0018 ± 0.0020, same top-1 token
+98.6%.
+
+These numbers come from a 4-vCPU server core with two 128-bit SIMD pipes. **They do not predict
+Snapdragon X results.** Nobody has measured the package on Snapdragon X yet, so whether it beats the
+5.02 tok/s tg128 baseline there is still open. Run `bonsai-benchmark.sh` on the laptop to find out.
+
+The KL divergence is not zero even though the integer dot products are exact. The patched kernel sums
+the per-block float terms in a different order, so each dot changes by about 1e-7 relative. Across 32
+recurrent and attention layers that perturbation grows to the KLD above. A residual risk remains:
+nobody has yet tested whether a pure float reordering accounts for all of it.
+
 ## 3. Investigated, not changed (yet)
 
 | area | finding | decision |

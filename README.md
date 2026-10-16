@@ -122,6 +122,27 @@ close other applications.
 | CPU tg128 | 5.02 |
 | Vulkan tg128 (excluded: desktop lag) | 4.22 |
 
+## Measured results (CI hardware, not Snapdragon X)
+
+Real model, `Ternary-Bonsai-2-9B-PQ2_0.gguf` (arch `qwen35`, 8.95 B params, every weight tensor PQ2_0
+including the 248k-vocabulary embedding and output head). GitHub `ubuntu-24.04-arm` runner: Arm
+Neoverse N2, 4 vCPU, `-t 4 -ngl 0 -p 256 -n 128 -r 3`, same machine, same CPU module (`armv8.6_2`),
+run back to back
+([model-validation run](https://github.com/SatoruGoj0/Bonsai-Oryon/actions/runs/38889641006)):
+
+| build | pp256 tok/s | tg128 tok/s |
+|---|---|---|
+| pinned upstream kernels (patches 0003+0004 only) | 8.95 ± 0.01 | 6.73 ± 0.06 |
+| Bonsai Oryon (all patches) | **13.80 ± 0.01** (+54%) | **7.82 ± 0.01** (+16%) |
+
+Output compatibility on the same model, full-vocabulary logits against the unpatched kernels over
+1024 tokens: mean KL divergence 5.2e-4 (threshold 1e-3), PPL ratio 1.0018 ± 0.0020, same top-1 token
+98.6%.
+
+These numbers come from a 4-vCPU server core with two 128-bit SIMD pipes. **They do not predict
+Snapdragon X results.** Nobody has measured the package on Snapdragon X yet, so whether it beats the
+5.02 tok/s tg128 baseline there is still open. Run `bonsai-benchmark.sh` on the laptop to find out.
+
 ## What was changed and why
 
 See [docs/OPTIMIZATIONS.md](docs/OPTIMIZATIONS.md) for the full analysis. Summary of
