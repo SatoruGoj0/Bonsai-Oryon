@@ -7,7 +7,7 @@ First release. Upstream is PrismML llama.cpp `prism` @ `e3de715222b2667c54a26744
 - `0001` AArch64 NEON PQ2_0 × Q8_K kernel: de-interleaved decode (VLD4 + shift/mask), the −1 offset
   folded out through Q8_K `bsums`, 4 blocks per float vector, and a new bit-consistent 2×2 tile for
   prompt processing.
-- `0002` NEON `quantize_row_q8_K`, bit-identical to the reference. It measured no faster than GCC's auto-vectorized reference on Neoverse N2.
+- `0002` NEON `quantize_row_q8_K`, bit-identical to the reference, 1.26× faster on Neoverse N2.
 - `0003` `armv8.6_nosve` CPU variant (DOTPROD+FP16+I8MM, no SVE), which Snapdragon X now selects.
 - `0004` backends load only from `/usr/lib/bonsai-oryon`.
 - Debian package `bonsai-oryon_0.1.0_arm64.deb`: `bonsai-cli`, `bonsai-server`, `bonsai-bench`, with

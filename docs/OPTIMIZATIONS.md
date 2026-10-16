@@ -61,6 +61,11 @@ acc  = sdot(sdot(sdot(sdot(acc, c0, y0), c1, y1), c2, y2), c3, y3)
   replaces four scalar `addv`/`fmadd` chains.
 * Result: **≈ 42 instructions per 128-weight block** (GCC 14 `-O3`, counted from the loop body), about
   half of upstream, with no loop-carried scalar FP dependency.
+* **Measured** (CI runner, Arm Neoverse N2, one thread, `-march=armv8.6-a+dotprod+fp16+i8mm`, 4096-wide
+  rows): upstream 14.3 Gweights/s, Bonsai 19.1 Gweights/s, a **1.33×** speedup. The result is the same
+  for a 35 KB cache-resident matrix and an 8.9 MB matrix, so the kernel is compute-bound on that core.
+  N2 has two 128-bit SIMD pipes, while Oryon is reported to have four, so the gain on Snapdragon X
+  may differ in either direction. It has **not been measured** there.
 * **2×2 tile** (`nrc == 2`, `nrows = 2` on AArch64 NEON): for prompt processing, each weight vector
   is decoded once and each activation vector loaded once for two rows × two tokens. The float
   operations for a given (row, column) are identical to the single-row path. Batched pp output is
@@ -82,10 +87,8 @@ fuses `iscale*x + magic` into one FMA (confirmed in the disassembly). A plain mu
 FCVTNS gave 39 mismatches in 1668 blocks, all on rounding ties. The patch therefore uses FMLA with the
 same magic constant, and the result has 0 mismatches.
 
-**Measured:** on the CI runner (Neoverse N2, single thread, 12288 floats) the NEON version is the same
-speed as the reference (8.84 µs each). GCC 14 at `-O3` already auto-vectorizes the reference loop
-well. The patch is kept because its output is bit-identical and it carries no risk, but it is **not**
-a source of speedup. Activation quantization is a negligible share of a token anyway.
+**Measured** (CI runner, Neoverse N2, single thread, 12288 floats): reference 8.85 µs, NEON 7.04 µs,
+a 1.26× speedup. Activation quantization is a small share of a token in any case.
 
 ### 0003: `armv8.6_nosve` CPU variant
 

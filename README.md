@@ -133,9 +133,9 @@ See [docs/OPTIMIZATIONS.md](docs/OPTIMIZATIONS.md) for the full analysis. Summar
    using the Q8_K block sums, and it scales four blocks per float vector instead of running a scalar
    multiply-add chain. A new 2×2 tile (`nrc == 2`) serves prompt processing: each weight vector is
    decoded once and used for two tokens. Batched and single-token results stay bit-identical.
+   Measured single-thread GEMV speedup on a Neoverse N2 CI runner: 1.33×.
 2. **`0002` NEON `quantize_row_q8_K`.** On ARM this was the scalar reference. The new version is
-   bit-identical to it, but it measured no faster on Neoverse N2 (GCC already auto-vectorizes the
-   reference), so it is not a speed claim.
+   bit-identical to it (1.26× faster on Neoverse N2).
 3. **`0003` `armv8.6_nosve` CPU variant.** Every upstream I8MM variant also requires SVE. Snapdragon
    X has I8MM but no SVE, so it was dispatched to `armv8.2_2` and lost the I8MM kernels for
    non-PQ2_0 tensors (Q8_0/Q4_K repacks).

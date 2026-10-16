@@ -68,7 +68,7 @@ jobs:
           { echo "### real-model A/B, $(lscpu | sed -n 's/^Model name: *//p' | head -1), $(nproc) vCPU - NOT Snapdragon X"; echo; } > results/real-ab.md
           for v in base opt; do
             echo "#### $v" >> results/real-ab.md
-            BONSAI_BACKEND_DIR=$PWD/$v/bin $v/bin/llama-bench -m /models/bonsai.gguf -t 4 -ngl 0 -p 256 -n 128 -r 3 -o md 2>&1 | grep -E '^\|' | tee -a results/real-ab.md
+            LD_LIBRARY_PATH=$PWD/$v/bin BONSAI_BACKEND_DIR=$PWD/$v/bin $v/bin/llama-bench -m /models/bonsai.gguf -t 4 -ngl 0 -p 256 -n 128 -r 3 -o md 2>&1 | grep -E '^\|' | tee -a results/real-ab.md
             echo >> results/real-ab.md
           done
       - if: always()

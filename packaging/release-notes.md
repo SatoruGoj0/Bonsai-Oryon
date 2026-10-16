@@ -36,7 +36,7 @@ sudo apt remove bonsai-oryon     # your existing llama.cpp build is untouched
 ## What's inside
 
 - `0001` NEON PQ2_0×Q8_K kernel: de-interleaved decode, offset folded out through the Q8_K bsums, a 2×2 tile for prompt processing. Batched and single-token results are bit-identical.
-- `0002` NEON `quantize_row_q8_K`, bit-identical to the reference. It measured no faster than GCC's auto-vectorized reference on Neoverse N2.
+- `0002` NEON `quantize_row_q8_K`, bit-identical to the reference, 1.26× faster on Neoverse N2.
 - `0003` `armv8.6_nosve` CPU variant. Snapdragon X has I8MM but no SVE; it now gets the I8MM kernels.
 - `0004` backends load only from `/usr/lib/bonsai-oryon`, never from the CWD.
 

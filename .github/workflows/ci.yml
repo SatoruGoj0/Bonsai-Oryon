@@ -158,7 +158,9 @@ jobs:
       - name: functional tests (CLI, bench, server/OpenAI API, CPU detection)
         run: |
           mkdir -p results; echo "### functional tests (build tree, runner: $(lscpu | sed -n 's/^Model name: *//p' | head -1))" > results/functional.md
-          BONSAI_BACKEND_DIR=$PWD/opt/bin THREADS=4 tests/functional/run-functional.sh opt/bin fixtures/tiny-pq2_0.gguf results/functional.md
+          # build-tree binaries carry the build machine's RPATH; point the loader at the unpacked libs
+          LD_LIBRARY_PATH=$PWD/opt/bin BONSAI_BACKEND_DIR=$PWD/opt/bin EXPECT_BACKEND_DIR=$PWD/opt/bin THREADS=4 \
+            tests/functional/run-functional.sh opt/bin fixtures/tiny-pq2_0.gguf results/functional.md
       - name: numerical compatibility vs unpatched upstream kernels (KL divergence)
         run: |
           echo "### numerical compatibility (tiny synthetic PQ2_0 model, full-vocab logits)" > results/numerics.md
@@ -169,7 +171,7 @@ jobs:
           set -e
           { echo "### A/B throughput, tiny synthetic model, $(lscpu | sed -n 's/^Model name: *//p' | head -1), 4 threads"; echo; } > results/ab-tiny.md
           for v in base opt; do
-            BONSAI_BACKEND_DIR=$PWD/$v/bin $v/bin/llama-bench -m fixtures/tiny-pq2_0.gguf -t 4 -ngl 0 -p 256 -n 128 -r 3 -o md | tee -a results/ab-tiny.md
+            LD_LIBRARY_PATH=$PWD/$v/bin BONSAI_BACKEND_DIR=$PWD/$v/bin $v/bin/llama-bench -m fixtures/tiny-pq2_0.gguf -t 4 -ngl 0 -p 256 -n 128 -r 3 -o md | tee -a results/ab-tiny.md
             echo >> results/ab-tiny.md
           done
       - if: always()
