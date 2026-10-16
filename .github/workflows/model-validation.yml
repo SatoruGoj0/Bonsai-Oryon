@@ -21,6 +21,10 @@ permissions:
 env:
   MODEL_URL: https://huggingface.co/prism-ml/Ternary-Bonsai-2-9B-gguf/resolve/main/Ternary-Bonsai-2-9B-PQ2_0.gguf
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   validate:
     runs-on: ubuntu-24.04-arm
@@ -116,6 +120,23 @@ jobs:
           abd "v0.3 threadpool, pure spin (BONSAI_BARRIER_SPIN=-1)" opt/bin BONSAI_BARRIER_SPIN=-1
           abd "v0.3 threadpool, yield (BONSAI_BARRIER_SPIN=0)" opt/bin BONSAI_BARRIER_SPIN=0
           abd "v0.3 threadpool, ternary 4-row" opt/bin BONSAI_PQ2_TERNARY=1
+          cat $R
+      - name: barrier policy under oversubscription (2x more threads than vCPUs, like a loaded desktop)
+        run: |
+          R=results/real-oversub.md; N=$(nproc)
+          { echo "### barrier policies, tg64, threads = $N (all vCPUs) and $((2 * N)) (oversubscribed), runner CPU - NOT Snapdragon X"; echo
+            echo "| configuration | t=$N tg64 | t=$((2 * N)) tg64 |"; echo "|---|---|---|"; } > $R
+          for v in "threadpool spin 4096 (default)|opt/bin|BONSAI_BARRIER_SPIN=4096" "threadpool spin 0 (yield)|opt/bin|BONSAI_BARRIER_SPIN=0" \
+                   "threadpool spin 65536|opt/bin|BONSAI_BARRIER_SPIN=65536" "threadpool pure spin (-1, upstream)|opt/bin|BONSAI_BARRIER_SPIN=-1" \
+                   "OpenMP (v0.2)|opt/bin/omp|BONSAI_BARRIER_SPIN=4096" "upstream OpenMP build|base/bin|BONSAI_BARRIER_SPIN=4096"; do
+            IFS='|' read -r n d e <<< "$v"; row="| $n |"
+            for t in $N $((2 * N)); do
+              r=$(env $e LD_LIBRARY_PATH=$PWD/${d%/omp} BONSAI_BACKEND_DIR=$PWD/$d timeout 900 ${d%/omp}/llama-bench -m /models/bonsai.gguf -t $t -ngl 0 -p 0 -n 64 -r 2 -o json 2>/dev/null \
+                  | python3 -c 'import json,sys; r=json.load(sys.stdin)[0]; print("%.2f ± %.2f" % (r["avg_ts"], r["stddev_ts"]))' || echo failed)
+              row="$row $r |"
+            done
+            echo "$row" >> $R
+          done
           cat $R
       - name: where decode time goes (BONSAI_PROFILE=1, tg64, 4 threads)
         run: |

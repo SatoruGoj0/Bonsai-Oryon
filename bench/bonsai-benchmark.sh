@@ -18,7 +18,7 @@
 #   * model load time and peak RSS are measured separately (repacked vs plain layout, mmap vs no-mmap).
 #
 # Configurations (all CPU only, -ngl 0, same model file):
-#   short: v0.3 balanced profile, v0.3 at 8 threads, v0.2-equivalent (OpenMP modules, 4-row kernel, 4 thr),
+#   short: v0.3 balanced profile, v0.3 on all CPUs (if > 4), v0.2-equivalent (OpenMP modules, 4-row kernel, 4 thr),
 #          v0.1-equivalent (OpenMP modules, plain kernel, 4 thr)
 #   full : + threadpool at 2/3/5/6 threads, barrier spin variants, poll 0/100, per-cluster pinning,
 #          bounded OpenMP active wait, ternary layout, throughput profile
@@ -86,12 +86,12 @@ clusters() {
 CONF=()
 add() { CONF+=("$1|$2|$3|${4:-$BENCH}"); }
 add "v0.3-balanced"   "-" "--oryon-profile balanced"
-add "v0.3-t8"         "-" "-t 8"
+[ "$NCPU" -gt 4 ] && add "v0.3-t$NCPU" "-" "-t $NCPU"   # all CPUs (8 on Snapdragon X)
 add "v0.2-equiv-t4"   "BONSAI_BACKEND_DIR=$LIBDIR/omp" "-t 4"
 add "v0.1-equiv-t4"   "BONSAI_BACKEND_DIR=$LIBDIR/omp BONSAI_PQ2_REPACK=0" "-t 4"
 REF="v0.2-equiv-t4"
 if [ $MODE = full ]; then
-    for t in 2 3 5 6; do [ $t -le $NCPU ] && add "v0.3-t$t" "-" "-t $t"; done
+    for t in 2 3 5 6; do [ $t -lt $NCPU ] && add "v0.3-t$t" "-" "-t $t"; done
     add "v0.3-t4-purespin"   "BONSAI_BARRIER_SPIN=-1" "-t 4"
     add "v0.3-t4-yield"      "BONSAI_BARRIER_SPIN=0"  "-t 4"
     add "v0.3-t4-poll0"      "-" "-t 4 --poll 0"
@@ -121,7 +121,7 @@ echo "- machine: $(cat /sys/devices/virtual/dmi/id/sys_vendor 2>/dev/null) $(cat
 echo "- cpu: $(lscpu | sed -n 's/^Model name: *//p' | sort -u | tr '\n' ' ')($NCPU cpus); clusters: $(clusters | awk '{printf "[%s] ", $2}')"
 echo "- cpu features: $(grep -m1 Features /proc/cpuinfo | cut -d: -f2)"
 echo "- kernel: $(uname -r); os: $(. /etc/os-release; echo "$PRETTY_NAME")"
-echo "- package: bonsai-oryon $(dpkg-query -W -f='${Version}' bonsai-oryon 2>/dev/null || echo '(not installed via dpkg)'); bench: $("$BENCH" --version 2>&1 | grep -m1 -i version)"
+echo "- package: bonsai-oryon $(dpkg-query -W -f='${Version}' bonsai-oryon 2>/dev/null || echo '(not installed via dpkg)'); binary: $(command -v "$BENCH")"
 echo "- power: $(ac_state); platform profile: $(cat /sys/firmware/acpi/platform_profile 2>/dev/null || echo n/a); governor: $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo n/a)"
 echo "- memory available: $(mem_avail_mb) MiB of $(free -m | awk '/Mem:/{print $2}') MiB; load average: $(cut -d' ' -f1-3 /proc/loadavg)"
 echo "- start temperature $(max_temp_c) C, CPU frequency cap avg $(freq_cap_mhz) MHz (hardware max $(cat /sys/devices/system/cpu/cpufreq/policy*/cpuinfo_max_freq 2>/dev/null | sort -n | tail -1 | awk '{print int($1/1000)}') MHz)"

@@ -26,7 +26,7 @@ for group in "batched:$CTX" "decode:1"; do
     ppl=$(grep -oE 'Final estimate: PPL = [0-9.]+' "$W/$g-ref.log" | grep -oE '[0-9.]+$')
     echo "| $g | reference: threadpool, 1 thread (PPL $ppl) | - |" >> "$RESULTS"
     confs=()
-    for t in 2 3 4 "$NCPU"; do confs+=("threadpool t=$t|$t|-"); done
+    for t in $(printf '2\n3\n4\n%s\n' "$NCPU" | sort -un); do confs+=("threadpool t=$t|$t|-"); done
     confs+=("threadpool t=4 BONSAI_BARRIER_SPIN=0 (yield)|4|BONSAI_BARRIER_SPIN=0"
             "threadpool t=4 BONSAI_BARRIER_SPIN=-1 (pure spin)|4|BONSAI_BARRIER_SPIN=-1"
             "threadpool t=3 BONSAI_TG_NOBARRIER=1|3|BONSAI_TG_NOBARRIER=1"

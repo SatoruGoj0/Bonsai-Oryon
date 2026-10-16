@@ -32,6 +32,10 @@ env:
   BUILD_DEPS: git ca-certificates build-essential cmake ninja-build python3 file dpkg-dev patchelf
   BONSAI_VERSION: '0.3.0'   # keep in sync with scripts/common.sh (checked in the build job)
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   kernel-tests:
     name: kernel tests (${{ matrix.name }})
@@ -256,7 +260,7 @@ jobs:
           bonsai-tune -m fixtures/tiny-pq2_0.gguf --rounds 1 --dry-run | tee /tmp/tune.txt
           grep -q 'selected: generation' /tmp/tune.txt
           /usr/share/bonsai-oryon/bonsai-benchmark.sh --short -m fixtures/tiny-pq2_0.gguf -r 2 --cooldown 0 -o /tmp/bb | tail -40
-          grep -q 'v0.2-equiv-t4' /tmp/bb/report.md && grep -q 'v0.3-balanced' /tmp/bb/report.md
+          grep -q 'v0.2-equiv-t4 |' /tmp/bb/report.md && grep -q 'v0.3-balanced' /tmp/bb/report.md
           echo "- \`bonsai-tune --dry-run\` and \`bonsai-benchmark.sh --short\` run from the package" >> results/package.md
       - name: bonsai-diag from the installed package
         run: |

@@ -11,8 +11,8 @@ graph and graph wall time, for both the threadpool and the OpenMP build.
 When disabled the cost is one predictable branch per node.
 
 In the threadpool (non-OpenMP) build, waiters in ggml_barrier spin with the
-CPU spin hint for BONSAI_BARRIER_SPIN iterations (default 65536, about
-tens of microseconds) and then call sched_yield() between checks, so that
+CPU spin hint for BONSAI_BARRIER_SPIN iterations (default 4096, a few
+microseconds) and then call sched_yield() between checks, so that
 when there are more runnable threads than free cores (desktop load, a
 throttled laptop) a spinning worker does not keep the core the late worker
 needs. BONSAI_BARRIER_SPIN=-1 restores the unbounded upstream spin, 0
@@ -20,14 +20,14 @@ yields immediately.
 
 Part of Bonsai-Oryon (https://github.com/SatoruGoj0/Bonsai-Oryon).
 ---
- ggml/src/ggml-cpu/ggml-cpu.c | 129 ++++++++++++++++++++++++++++++++++-
- 1 file changed, 128 insertions(+), 1 deletion(-)
+ ggml/src/ggml-cpu/ggml-cpu.c | 131 ++++++++++++++++++++++++++++++++++-
+ 1 file changed, 130 insertions(+), 1 deletion(-)
 
 diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
-index 2024554..c8b319e 100644
+index 2024554..fa8f26f 100644
 --- a/ggml/src/ggml-cpu/ggml-cpu.c
 +++ b/ggml/src/ggml-cpu/ggml-cpu.c
-@@ -593,6 +593,95 @@ struct ggml_state {
+@@ -593,6 +593,97 @@ struct ggml_state {
  
  static struct ggml_state g_state = {0};
  
@@ -108,14 +108,16 @@ index 2024554..c8b319e 100644
 +// ---------------------------------------------------------------------------------------------------------
 +// Bonsai-Oryon: bounded spin, then yield, in the threadpool barrier (non-OpenMP builds). Upstream spins without
 +// bound; when there are more runnable threads than free cores (desktop load, battery throttling) a spinning
-+// worker can occupy the core that the one late worker is waiting for. After BONSAI_BARRIER_SPIN iterations of
-+// the CPU's spin hint the waiter calls sched_yield() between checks. -1 restores the unbounded spin.
++// worker can occupy the core that the one late worker is waiting for (measured: with 2x more threads than
++// cores the unbounded spin was 10-100x slower than spin-then-yield). After BONSAI_BARRIER_SPIN iterations of
++// the CPU's spin hint (default 4096, a few microseconds on current cores) the waiter calls sched_yield()
++// between checks. -1 restores the unbounded spin, 0 yields right away.
 +// ---------------------------------------------------------------------------------------------------------
 +static int64_t bonsai_barrier_spin_limit = -2;
 +static inline int64_t bonsai_barrier_spin(void) {
 +    if (__builtin_expect(bonsai_barrier_spin_limit == -2, 0)) {
 +        const char * e = getenv("BONSAI_BARRIER_SPIN");
-+        bonsai_barrier_spin_limit = e && e[0] ? strtoll(e, NULL, 10) : 65536;
++        bonsai_barrier_spin_limit = e && e[0] ? strtoll(e, NULL, 10) : 4096;
 +    }
 +    return bonsai_barrier_spin_limit;
 +}
@@ -123,7 +125,7 @@ index 2024554..c8b319e 100644
  void ggml_barrier(struct ggml_threadpool * tp) {
      int n_threads = atomic_load_explicit(&tp->n_graph, memory_order_relaxed) & GGML_THREADPOOL_N_THREADS_MASK;
      if (n_threads == 1) {
-@@ -617,8 +706,14 @@ void ggml_barrier(struct ggml_threadpool * tp) {
+@@ -617,8 +708,14 @@ void ggml_barrier(struct ggml_threadpool * tp) {
      }
  
      // wait for other threads
@@ -139,7 +141,7 @@ index 2024554..c8b319e 100644
      }
  
      // exit barrier (full seq-cst fence)
-@@ -3157,6 +3252,13 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+@@ -3157,6 +3254,13 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
      GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
  #endif
  
@@ -153,7 +155,7 @@ index 2024554..c8b319e 100644
      for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
          struct ggml_tensor * node = cgraph->nodes[node_n];
  
-@@ -3171,12 +3273,23 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+@@ -3171,12 +3275,23 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
  
          // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
          // Try fused ops, fall back to normal compute
@@ -177,7 +179,7 @@ index 2024554..c8b319e 100644
  
          if (state->ith == 0 && cplan->abort_callback &&
                  cplan->abort_callback(cplan->abort_callback_data)) {
-@@ -3186,6 +3299,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+@@ -3186,6 +3301,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
  
          if (node_n + 1 < cgraph->n_nodes) {
              ggml_barrier(state->threadpool);
@@ -185,7 +187,7 @@ index 2024554..c8b319e 100644
          }
      }
  
-@@ -3195,7 +3309,9 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+@@ -3195,7 +3311,9 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
      GGML_PRINT_DEBUG("thread #%d compute-done cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
  #endif
  
@@ -195,7 +197,7 @@ index 2024554..c8b319e 100644
  
  #ifdef GGML_USE_CPU_RISCV64_SPACEMIT
      ggml_backend_cpu_riscv64_spacemit_clear_numa_thread_affinity_threaded(state->ith);
-@@ -3431,6 +3547,12 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
+@@ -3431,6 +3549,12 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
  
      bool disposable_threadpool = false;
  
@@ -208,7 +210,7 @@ index 2024554..c8b319e 100644
      if (threadpool == NULL) {
          //GGML_PRINT_DEBUG("Threadpool is not specified. Will create a disposable threadpool : n_threads %d\n", n_threads);
          disposable_threadpool = true;
-@@ -3484,6 +3606,11 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
+@@ -3484,6 +3608,11 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
      ggml_graph_compute_thread(&threadpool->workers[0]);
  #endif
  

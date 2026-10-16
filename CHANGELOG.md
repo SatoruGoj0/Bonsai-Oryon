@@ -9,7 +9,7 @@ Focus: threading and synchronization of single-token decoding on Snapdragon X, m
   graphs, instead of libgomp's spin-then-futex barrier on every node. The v0.2 OpenMP modules (same kernels)
   are still shipped in `/usr/lib/bonsai-oryon/omp` (`BONSAI_BACKEND_DIR=/usr/lib/bonsai-oryon/omp`).
 - **0007** graph profiler (`BONSAI_PROFILE=1`: per-op time, compute vs barrier wait, wake-up latency) and a
-  bounded barrier spin (`BONSAI_BARRIER_SPIN`, default 65536 spins then `sched_yield()`; `-1` = upstream pure
+  bounded barrier spin (`BONSAI_BARRIER_SPIN`, default 4096 spins then `sched_yield()`; `-1` = upstream pure
   spin). No unbounded busy-wait is enabled by default.
 - **0008** `--oryon-profile balanced|throughput|low-power|auto|none` for cli, server and bench. `auto` (default
   for cli/server) uses the per-user profile written by the new `bonsai-tune`, else `balanced`
