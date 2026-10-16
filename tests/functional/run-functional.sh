@@ -30,7 +30,7 @@ else bad "cli-generate" "exit $rc; $(tail -5 "$WORK/cli.err" | tr '\n' ' ')"; fi
 timeout 600 $EMU "$BENCH" -m "$MODEL" -t "$T" -ngl 0 -p 8 -n 2 -r 1 > /dev/null 2> "$WORK/load.err"
 want=${EXPECT_VARIANT:-$("$HERE/expected-cpu-variant.sh")}
 got=$(grep -oE 'loaded CPU backend from [^ ]+' "$WORK/load.err" | head -1 | grep -oE 'libggml-cpu-[A-Za-z0-9_.]+\.so' | sed 's/^libggml-cpu-//; s/\.so$//')
-if [ -n "$got" ] && [ "$got" = "$want" ]; then ok "cpu-variant-selection" "loaded $got (expected from /proc/cpuinfo: $want)"
+if [ -n "$got" ] && [ "$got" = "$want" ]; then ok "cpu-variant-selection" "loaded $got (expected ${EXPECT_VARIANT:+[env] }from CPU features: $want)"
 else bad "cpu-variant-selection" "loaded '${got}', expected '$want'"; grep -i backend "$WORK/load.err" | head; fi
 case "$(grep -oE 'loaded CPU backend from [^ ]+' "$WORK/load.err" | head -1)" in
     *"${EXPECT_BACKEND_DIR:-/usr/lib/bonsai-oryon}"/*) ok "backend-dir" "$(grep -oE 'loaded CPU backend from [^ ]+' "$WORK/load.err" | head -1)";;

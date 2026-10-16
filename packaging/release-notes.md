@@ -40,7 +40,7 @@ sudo apt remove bonsai-oryon     # your existing llama.cpp build is untouched
 - `0003` `armv8.6_nosve` CPU variant. Snapdragon X has I8MM but no SVE; it now gets the I8MM kernels.
 - `0004` backends load only from `/usr/lib/bonsai-oryon`, never from the CWD.
 
-Full details are in [docs/OPTIMIZATIONS.md](https://github.com/SatoruGoj0/Bonsai-Oryon/blob/main/docs/OPTIMIZATIONS.md).
+Full details are in [docs/OPTIMIZATIONS.md](https://github.com/SatoruGoj0/Bonsai-Oryon/blob/claude/wonderful-curie-my0ukq/docs/OPTIMIZATIONS.md).
 
 ## Known limitations
 
