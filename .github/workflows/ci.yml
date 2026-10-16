@@ -62,6 +62,8 @@ jobs:
           { echo "### kernel tests: ${{ matrix.name }} (-march=${{ matrix.arch }})"; echo; echo '```'
             echo "runner cpu: $(lscpu | sed -n 's/^Model name: *//p' | head -1); features: $(grep -m1 Features /proc/cpuinfo | cut -d: -f2)"
             ./kt/test-pq2-kernels --bench
+            echo "--- same tests and backend benchmark with the opt-in ternary layout (BONSAI_PQ2_TERNARY=1)"
+            BONSAI_PQ2_TERNARY=1 ./kt/test-pq2-kernels --bench | grep -E 'repack|bench-mt|checks|FAIL'
             echo "--- upstream test-quantize-fns"; ./kt/test-quantize-fns
             echo "--- upstream test-pq2-row-shapes"; ./kt/test-pq2-row-shapes
             echo '```'; } 2>&1 | tee "results/kernel-${{ strategy.job-index }}.md"
@@ -168,10 +170,16 @@ jobs:
           echo "### numerical compatibility (tiny synthetic PQ2_0 model, full-vocab logits)" > results/numerics.md
           BASE_BACKEND_DIR=$PWD/base/bin OPT_BACKEND_DIR=$PWD/opt/bin THREADS=4 \
             tests/numerics/compare-kld.sh base/bin/llama-perplexity opt/bin/llama-perplexity fixtures/tiny-pq2_0.gguf fixtures/sample.txt results/numerics.md
+      - name: numerical compatibility with the opt-in ternary layout (BONSAI_PQ2_TERNARY=1)
+        run: |
+          echo "### numerical compatibility, ternary 4-row layout (tiny synthetic model, it is ternary by construction)" > results/numerics-ternary.md
+          BONSAI_PQ2_TERNARY=1 BASE_BACKEND_DIR=$PWD/base/bin OPT_BACKEND_DIR=$PWD/opt/bin THREADS=4 \
+            tests/numerics/compare-kld.sh base/bin/llama-perplexity opt/bin/llama-perplexity fixtures/tiny-pq2_0.gguf fixtures/sample.txt results/numerics-ternary.md
       - name: bonsai-diag (memory bandwidth vs PQ2_0 GEMV, runner CPU)
         run: |
           { echo "### bonsai-diag on the CI runner ($(lscpu | sed -n 's/^Model name: *//p' | head -1)) - NOT Snapdragon X"; echo; echo '```'; } > results/diag.md
           LD_LIBRARY_PATH=$PWD/opt/bin BONSAI_BACKEND_DIR=$PWD/opt/bin opt/bin/bonsai-diag 4 --quick | tee -a results/diag.md
+          LD_LIBRARY_PATH=$PWD/opt/bin BONSAI_BACKEND_DIR=$PWD/opt/bin BONSAI_PQ2_TERNARY=1 opt/bin/bonsai-diag 4 --quick | grep -E 'gemv|4-row' | tee -a results/diag.md
           echo '```' >> results/diag.md
       - name: A/B throughput on the tiny model (CI runner, NOT Snapdragon X)
         run: |
@@ -219,6 +227,7 @@ jobs:
         run: |
           /usr/lib/bonsai-oryon/bin/bonsai-diag 2 --quick | tee /tmp/diag.txt
           grep -q "4-row (v0.2)" /tmp/diag.txt
+          BONSAI_PQ2_TERNARY=1 /usr/lib/bonsai-oryon/bin/bonsai-diag 2 --quick | grep -q "4-row ternary"
           echo "- \`bonsai-diag\` runs from the package and reports the 4-row layout" >> results/package.md
       - name: remove and purge
         run: |
@@ -258,7 +267,7 @@ jobs:
             echo; echo "## Test results of this build (workflow run ${{ github.run_id }}, commit ${{ github.sha }})"; echo
             echo "All results below come from GitHub's generic ARM64 runners (Arm Neoverse), i.e. functional validation."
             echo "They are **not** Snapdragon X performance measurements."; echo
-            for f in results/kernel-*.md results/functional.md results/numerics.md results/diag.md results/package.md; do [ -f "$f" ] && { cat "$f"; echo; }; done
+            for f in results/kernel-*.md results/functional.md results/numerics.md results/numerics-ternary.md results/diag.md results/package.md; do [ -f "$f" ] && { cat "$f"; echo; }; done
             echo "## SHA-256"; echo; echo '```'; cat dist/*.sha256; echo '```'
           } >> notes.md
           (cd dist && sha256sum bonsai-oryon_${{ env.BONSAI_VERSION }}_arm64.deb > SHA256SUMS)

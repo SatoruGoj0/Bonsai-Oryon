@@ -430,9 +430,18 @@ static void test_repack_4row() {
     if (!buft) return;
     ggml_backend_t be = ggml_backend_cpu_init();
     ggml_backend_cpu_set_n_threads(be, 4);
-    struct Case { int64_t K, M; } cases[] = { {4096, 64}, {12288, 32}, {256, 8}, {768, 12} };
+    const char * te = getenv("BONSAI_PQ2_TERNARY");
+    const bool tern_mode = te && te[0] == '1';
+    struct Case { int64_t K, M; bool ternary_data; } cases[] = {
+        {4096, 64, true}, {12288, 32, true}, {256, 8, true}, {768, 12, true}, {4096, 16, false}, {768, 8, false} };
     for (auto c : cases) {
         auto wq = random_pq2(c.K * c.M);
+        if (c.ternary_data) {
+            // codes restricted to {0,1,2} (weights -1/0/+1), like the Ternary-Bonsai checkpoints
+            for (auto & blk : wq) for (auto & q : blk.qs) {
+                q = 0; for (int j = 0; j < 4; j++) q |= (uint8_t) ((rng() % 3) << (2 * j));
+            }
+        }
         repacked_weight rw;
         ggml_init_params ip = { ggml_tensor_overhead() * 2, nullptr, true };
         rw.ctx = ggml_init(ip);
@@ -444,7 +453,16 @@ static void test_repack_4row() {
         CHECK(selected || (e && e[0] == '0'), "4-row PQ2_0 layout not selected for K=%" PRId64 " M=%" PRId64, c.K, c.M);
 #endif
         if (!selected) { std::printf("[repack] K=%" PRId64 " M=%" PRId64 ": not selected on this build\n", c.K, c.M); continue; }
+        const void * extra_before = rw.w->extra;
         ggml_backend_tensor_set(rw.w, wq.data(), 0, ggml_nbytes(rw.w));
+        const bool switched = rw.w->extra != extra_before;   // ternary layout fell back to the 2-bit layout
+        const char * layout = !tern_mode ? "2-bit 4-row" : (switched ? "2-bit 4-row (fallback)" : "ternary 4-row");
+        if (tern_mode) {
+            CHECK(switched == !c.ternary_data, "ternary mode: %s data %s", c.ternary_data ? "ternary" : "non-ternary",
+                  switched ? "fell back to 2-bit" : "kept the ternary layout");
+        } else {
+            CHECK(!switched, "layout switched outside ternary mode");
+        }
         for (int64_t B : {1, 2, 3, 4, 7, 8, 9, 32}) {
             auto act = random_act(c.K * B);
             auto got = run_mul_mat_backend(be, rw.w, act, B);
@@ -463,8 +481,8 @@ static void test_repack_4row() {
                 if (std::memcmp(r1.data(), got.data() + b * c.M, c.M * 4) != 0) ++mism;
             }
             CHECK(mism == 0, "repacked K=%" PRId64 " B=%" PRId64 ": %d columns differ from single-token", c.K, B, mism);
-            std::printf("[repack] K=%-5" PRId64 " M=%-3" PRId64 " B=%-2" PRId64 " vs plain rel-rms=%.2e batched==single: %s\n",
-                        c.K, c.M, B, maxrel, mism == 0 ? "yes" : "NO");
+            std::printf("[repack] %-22s K=%-5" PRId64 " M=%-3" PRId64 " B=%-2" PRId64 " vs plain rel-rms=%.2e batched==single: %s\n",
+                        layout, c.K, c.M, B, maxrel, mism == 0 ? "yes" : "NO");
         }
     }
     ggml_backend_free(be);
@@ -475,6 +493,9 @@ static void bench_backend_gemv() {
     ggml_backend_buffer_type_t buft = find_repack_buft();
     const int64_t K = 4096, M = 32768;  // 134M weights, 35.7 MB: well beyond L2
     auto wq = random_pq2(K * M);
+    for (auto & blk : wq) for (auto & q : blk.qs) {   // ternary codes so the ternary layout (if enabled) is used
+        q = 0; for (int j = 0; j < 4; j++) q |= (uint8_t) ((rng() % 3) << (2 * j));
+    }
     auto act = random_act(K);
     repacked_weight plain, rep;
     for (auto * rw : {&plain, &rep}) {
@@ -484,7 +505,9 @@ static void bench_backend_gemv() {
         rw->buf = ggml_backend_alloc_ctx_tensors_from_buft(rw->ctx, rw == &rep && buft ? buft : ggml_backend_cpu_buffer_type());
         ggml_backend_tensor_set(rw->w, wq.data(), 0, ggml_nbytes(rw->w));
     }
-    std::printf("[bench-mt] tg-shaped GEMV 4096x32768 PQ2_0 (35.7 MB) via ggml backend (this CPU, not Snapdragon X)\n");
+    const char * te = getenv("BONSAI_PQ2_TERNARY");
+    std::printf("[bench-mt] tg-shaped GEMV 4096x32768 PQ2_0 (35.7 MB as PQ2_0) via ggml backend, 4-row layout = %s (this CPU, not Snapdragon X)\n",
+                te && te[0] == '1' ? "TERNARY 1.75 bpw" : "2-bit");
     for (int nt : {1, 2, 4, 8}) {
         if (nt > (int) std::thread::hardware_concurrency()) break;
         ggml_backend_t be = ggml_backend_cpu_init();

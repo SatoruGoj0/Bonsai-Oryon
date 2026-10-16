@@ -1,0 +1,388 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 16 Oct 2026 12:01:56 +0000
+Subject: [PATCH] ggml-cpu: arm: opt-in lossless ternary 4-row PQ2_0 layout
+ (1.75 bpw)
+
+BONSAI_PQ2_TERNARY=1 repacks PQ2_0 tensors whose codes are all in {0,1,2}
+(weights -1/0/+1, which is every tensor of the Ternary-Bonsai checkpoints)
+into block_ptq1_0x4r: PrismML's PTQ1_0 trit packing (5 trits per byte) for 4
+interleaved rows. Single-token decoding then streams 17.6% fewer bytes, at
+the cost of a more expensive decode, so this only helps on machines where
+decoding is memory-bandwidth-bound (bonsai-diag tells). A tensor with any +2
+code is detected at load time and keeps the lossless 2-bit 4-row layout.
+
+Integer sums and the float sequence are identical to the 2-bit 4-row
+kernels, so the results are bit-identical to them. GEMM uses a 4 rows x 2
+tokens tile. Groups keep the 4-plain-row stride so the repack mul_mat chunk
+addressing is unchanged (padding at the end of each group is never read).
+
+Part of Bonsai-Oryon (https://github.com/SatoruGoj0/Bonsai-Oryon).
+---
+ ggml/src/ggml-cpu/repack.cpp | 281 ++++++++++++++++++++++++++++++++++-
+ ggml/src/ggml-cpu/repack.h   |   9 ++
+ 2 files changed, 288 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-cpu/repack.cpp b/ggml/src/ggml-cpu/repack.cpp
+index 5943f2f..6e5ae96 100644
+--- a/ggml/src/ggml-cpu/repack.cpp
++++ b/ggml/src/ggml-cpu/repack.cpp
+@@ -441,6 +441,13 @@ static inline void ggml_repack_quantize_mat(const float * GGML_RESTRICT x, void
+     ggml_quantize_mat_t<INTER_SIZE, PARAM_TYPE>(x, vy, nrow, n_per_row);
+ }
+ 
++template <> inline void ggml_repack_quantize_mat<block_ptq1_0x4r, 16, GGML_TYPE_Q8_K>(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t nrow, int64_t n_per_row) {
++    const size_t row_size = ggml_row_size(GGML_TYPE_Q8_K, n_per_row);
++    for (int64_t r = 0; r < nrow; r++) {
++        ggml_get_type_traits_cpu(GGML_TYPE_Q8_K)->from_float(x + r * n_per_row, (char *) vy + r * row_size, n_per_row);
++    }
++}
++
+ // Bonsai-Oryon: the PQ2_0 4-row kernels read plain (non-interleaved) Q8_K activation rows
+ template <> inline void ggml_repack_quantize_mat<block_pq2_0x4r, 16, GGML_TYPE_Q8_K>(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t nrow, int64_t n_per_row) {
+     const size_t row_size = ggml_row_size(GGML_TYPE_Q8_K, n_per_row);
+@@ -4361,6 +4368,237 @@ static void ggml_gemm_pq2_0_4x16_q8_K(int n, float * GGML_RESTRICT s, size_t bs,
+ #endif
+ }
+ 
++
++// ---------------------------------------------------------------------------------------------------------
++// Bonsai-Oryon: opt-in 4-row TERNARY layout (block_ptq1_0x4r, 1.75 bpw instead of PQ2_0's 2.125).
++//
++// Ternary-Bonsai checkpoints only use the codes {0,1,2} (weights -1, 0, +1) of PQ2_0's 2-bit codec. Five trits
++// fit in a byte (3^5 = 243), so the same weights can be streamed with 17.6% fewer bytes, losslessly. The trit
++// packing is PrismML's PTQ1_0 encoding (stage 1: 16 bytes = 5 x 16 trits, stage 2: 8 bytes = 5 x 8 trits,
++// tail: 2 bytes = 4 x 2 trits; byte m digit n = weight m + 16n / 80 + m + 8n / 120 + h + 2n), laid out for
++// 4 rows as [d x4][stage1 r0..r3][stage2 r0..r3][tail r0..r3]. Decoding costs more ALU than the 2-bit
++// layout, so this only pays off when single-token decoding is memory-bandwidth-bound (see bonsai-diag).
++// Enabled with BONSAI_PQ2_TERNARY=1; a tensor that contains any +2 code keeps the lossless 2-bit layout.
++// ---------------------------------------------------------------------------------------------------------
++
++static bool pq2_0_tensor_is_ternary(const block_pq2_0 * src, int64_t nblk) {
++    for (int64_t i = 0; i < nblk; i++) {
++        for (int j = 0; j < QK_PQ2_0 / 4; j++) {
++            const uint8_t q = src[i].qs[j];
++            // a code of 3 has both bits of its pair set
++            if (q & (q >> 1) & 0x55) return false;
++        }
++    }
++    return true;
++}
++
++static inline uint8_t ptq1_pack(const int * t, int ntrits, int shift_extra) {
++    // most significant trit first, ceil(n * 256 / 243) as in quantize_row_ptq1_0_ref
++    uint16_t q = 0;
++    for (int n = 0; n < ntrits; n++) q = q * 3 + t[n];
++    for (int n = 0; n < shift_extra; n++) q *= 3;
++    return (uint8_t) ((q * 256 + 242) / 243);
++}
++
++static void ptq1_encode_row_block(const block_pq2_0 & in, uint8_t * s16, uint8_t * s8, uint8_t * tail) {
++    int c[QK_PQ2_0];
++    for (int j = 0; j < QK_PQ2_0; j++) c[j] = (in.qs[j / 4] >> (2 * (j % 4))) & 3;
++    for (int m = 0; m < 16; m++) { int t[5]; for (int n = 0; n < 5; n++) t[n] = c[m + 16 * n];      s16[m] = ptq1_pack(t, 5, 0); }
++    for (int m = 0; m < 8;  m++) { int t[5]; for (int n = 0; n < 5; n++) t[n] = c[80 + m + 8 * n];  s8[m]  = ptq1_pack(t, 5, 0); }
++    for (int h = 0; h < 2;  h++) { int t[4]; for (int n = 0; n < 4; n++) t[n] = c[120 + h + 2 * n]; tail[h] = ptq1_pack(t, 4, 1); }
++}
++
++static int repack_pq2_0_to_ptq1_0_4r(struct ggml_tensor * t, const void * GGML_RESTRICT data, size_t data_size) {
++    GGML_ASSERT(t->type == GGML_TYPE_PQ2_0);
++    const int64_t nrow    = ggml_nrows(t);
++    const int64_t nblocks = t->ne[0] / QK_PQ2_0;
++    GGML_ASSERT(data_size == (size_t) nrow * nblocks * sizeof(block_pq2_0));
++    const block_pq2_0 * src = (const block_pq2_0 *) data;
++    for (int64_t g = 0; g < nrow; g += 4) {
++        // groups keep the stride of 4 plain rows (the repack mul_mat addresses chunks as row * nb01); the
++        // smaller ternary blocks are packed at the start of each group and the tail padding is never read
++        block_ptq1_0x4r * dst = (block_ptq1_0x4r *) ((char *) t->data + (size_t) (g / 4) * nblocks * sizeof(block_pq2_0x4r));
++        for (int64_t b = 0; b < nblocks; b++) {
++            for (int r = 0; r < 4; r++) {
++                const block_pq2_0 & in = src[(g + r) * nblocks + b];
++                dst->d[r] = in.d;
++                ptq1_encode_row_block(in, dst->s16 + 16 * r, dst->s8 + 8 * r, dst->tail + 2 * r);
++            }
++            dst++;
++        }
++    }
++    return 0;
++}
++
++// first block of 4-row group x (groups are spaced like 4 plain PQ2_0 rows)
++static inline const block_ptq1_0x4r * ptq1r_group(const void * vx, int x, int nb) {
++    return (const block_ptq1_0x4r *) ((const char *) vx + (size_t) x * nb * sizeof(block_pq2_0x4r));
++}
++
++static void ptq1r_decode_ref(const block_ptq1_0x4r * b, int r, int8_t * codes /* 128, values 0..2 */) {
++    static const uint8_t pow3[5] = {1, 3, 9, 27, 81};
++    for (int m = 0; m < 16; m++) for (int n = 0; n < 5; n++) codes[m + 16 * n]     = (uint8_t) ((uint16_t) (uint8_t) (b->s16[16 * r + m] * pow3[n]) * 3 >> 8);
++    for (int m = 0; m < 8;  m++) for (int n = 0; n < 5; n++) codes[80 + m + 8 * n] = (uint8_t) ((uint16_t) (uint8_t) (b->s8[8 * r + m] * pow3[n]) * 3 >> 8);
++    for (int h = 0; h < 2;  h++) for (int n = 0; n < 4; n++) codes[120 + h + 2 * n] = (uint8_t) ((uint16_t) (uint8_t) (b->tail[2 * r + h] * pow3[n]) * 3 >> 8);
++}
++
++#if defined(__aarch64__) && defined(__ARM_NEON)
++#define PTQ1R_TRIT(v) vshrq_n_u8(vhaddq_u8((v), vshrq_n_u8((v), 1)), 6)   // (3*v) >> 8 per byte
++
++// codes (0..2) of rows r and r+1, stage-2 and tail parts, as e5/e6/e7 vectors per row
++static inline void ptq1r_decode_pair_tail(const block_ptq1_0x4r * GGML_RESTRICT b, int r, uint8x16_t e[2][3]) {
++    static const uint8_t k_tbl[16]  = {0, 1, 0, 1, 0, 1, 0, 1, 2, 3, 2, 3, 2, 3, 2, 3};
++    static const uint8_t k_pow3[16] = {1, 1, 3, 3, 9, 9, 27, 27, 1, 1, 3, 3, 9, 9, 27, 27};
++    const uint8x16_t c  = vld1q_u8(b->s8 + 8 * r);          // rows r | r+1, 8 bytes each
++    const uint8x16_t u0 = PTQ1R_TRIT(c);
++    const uint8x16_t u1 = PTQ1R_TRIT(vmulq_u8(c, vdupq_n_u8(3)));
++    const uint8x16_t u2 = PTQ1R_TRIT(vmulq_u8(c, vdupq_n_u8(9)));
++    const uint8x16_t u3 = PTQ1R_TRIT(vmulq_u8(c, vdupq_n_u8(27)));
++    const uint8x16_t u4 = PTQ1R_TRIT(vmulq_u8(c, vdupq_n_u8(81)));
++    const uint8x16_t h  = vqtbl1q_u8(vcombine_u8(vld1_u8(b->tail), vdup_n_u8(0)), vaddq_u8(vld1q_u8(k_tbl), vdupq_n_u8(2 * r)));
++    const uint8x16_t uh = PTQ1R_TRIT(vmulq_u8(h, vld1q_u8(k_pow3)));
++#define LO2(a, b2) vreinterpretq_u8_u64(vzip1q_u64(vreinterpretq_u64_u8(a), vreinterpretq_u64_u8(b2)))
++#define HI2(a, b2) vreinterpretq_u8_u64(vzip2q_u64(vreinterpretq_u64_u8(a), vreinterpretq_u64_u8(b2)))
++    e[0][0] = LO2(u0, u1); e[0][1] = LO2(u2, u3); e[0][2] = LO2(u4, uh);
++    e[1][0] = HI2(u0, u1); e[1][1] = HI2(u2, u3); e[1][2] = HI2(u4, uh);
++#undef LO2
++#undef HI2
++}
++
++static inline int32x4_t ptq1r_dot_s16(int32x4_t acc, const uint8_t * s16, const int8x16_t * y) {
++    const uint8x16_t a = vld1q_u8(s16);
++    acc = ggml_vdotq_s32(acc, vreinterpretq_s8_u8(PTQ1R_TRIT(a)),                         y[0]);
++    acc = ggml_vdotq_s32(acc, vreinterpretq_s8_u8(PTQ1R_TRIT(vmulq_u8(a, vdupq_n_u8(3)))),  y[1]);
++    acc = ggml_vdotq_s32(acc, vreinterpretq_s8_u8(PTQ1R_TRIT(vmulq_u8(a, vdupq_n_u8(9)))),  y[2]);
++    acc = ggml_vdotq_s32(acc, vreinterpretq_s8_u8(PTQ1R_TRIT(vmulq_u8(a, vdupq_n_u8(27)))), y[3]);
++    acc = ggml_vdotq_s32(acc, vreinterpretq_s8_u8(PTQ1R_TRIT(vmulq_u8(a, vdupq_n_u8(81)))), y[4]);
++    return acc;
++}
++
++static inline float32x4_t ptq1r_scales(const block_ptq1_0x4r * GGML_RESTRICT b, float yd) {
++    return vmulq_n_f32(vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16((const uint16_t *) b->d))), yd);
++}
++#endif
++
++
++#if defined(__aarch64__) && defined(__ARM_NEON)
++// integer sums (codes 0..2, offset not removed) for the 4 rows of one block against one token's 8 activation vectors
++static inline void ptq1r_block_rows(const block_ptq1_0x4r * GGML_RESTRICT b, const int8x16_t * yv, int32x4_t acc[4]) {
++    for (int r = 0; r < 4; r += 2) {
++        uint8x16_t e[2][3];
++        ptq1r_decode_pair_tail(b, r, e);
++        for (int p = 0; p < 2; p++) {
++            int32x4_t a = ptq1r_dot_s16(vdupq_n_s32(0), b->s16 + 16 * (r + p), yv);
++            a = ggml_vdotq_s32(a, vreinterpretq_s8_u8(e[p][0]), yv[5]);
++            a = ggml_vdotq_s32(a, vreinterpretq_s8_u8(e[p][1]), yv[6]);
++            a = ggml_vdotq_s32(a, vreinterpretq_s8_u8(e[p][2]), yv[7]);
++            acc[r + p] = a;
++        }
++    }
++}
++
++static inline float32x4_t ptq1r_accumulate(float32x4_t sumv, const block_ptq1_0x4r * GGML_RESTRICT b, const block_q8_K * GGML_RESTRICT yb,
++                                           int half, const int32x4_t acc[4]) {
++    const int32_t ysum = vaddlvq_s16(vld1q_s16(yb->bsums + 8 * half));
++    const int32x4_t isum = vsubq_s32(vpaddq_s32(vpaddq_s32(acc[0], acc[1]), vpaddq_s32(acc[2], acc[3])), vdupq_n_s32(ysum));
++    return vfmaq_f32(sumv, vcvtq_f32_s32(isum), ptq1r_scales(b, yb->d));
++}
++#endif
++
++static void ggml_gemv_ptq1_0_4r_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx,
++                                     const void * GGML_RESTRICT vy, int nr, int nc) {
++    GGML_UNUSED(bs);
++    GGML_UNUSED(nr);
++    assert(n % QK_K == 0 && nc % 4 == 0);
++    const int nb = n / QK_PQ2_0;
++    const block_q8_K * GGML_RESTRICT y = (const block_q8_K *) vy;
++    for (int x = 0; x < nc / 4; x++) {
++        const block_ptq1_0x4r * GGML_RESTRICT b = ptq1r_group(vx, x, nb);
++#if defined(__aarch64__) && defined(__ARM_NEON)
++        float32x4_t sumv = vdupq_n_f32(0.0f);
++        for (int i = 0; i < nb; i++, b++) {
++            const block_q8_K * GGML_RESTRICT yb = &y[i >> 1];
++            const int8_t     * GGML_RESTRICT q8 = yb->qs + 128 * (i & 1);
++            __builtin_prefetch((const char *) b + 448);
++            int8x16_t yv[8];
++            for (int k = 0; k < 8; k++) yv[k] = vld1q_s8(q8 + 16 * k);
++            int32x4_t acc[4];
++            ptq1r_block_rows(b, yv, acc);
++            sumv = ptq1r_accumulate(sumv, b, yb, i & 1, acc);
++        }
++        vst1q_f32(s + 4 * x, sumv);
++#else
++        float sumf[4] = {0, 0, 0, 0};
++        for (int i = 0; i < nb; i++, b++) {
++            const block_q8_K * yb = &y[i >> 1];
++            const int8_t * q8 = yb->qs + 128 * (i & 1);
++            int ysum = 0;
++            for (int k = 0; k < 8; k++) ysum += yb->bsums[8 * (i & 1) + k];
++            for (int r = 0; r < 4; r++) {
++                int8_t codes[QK_PQ2_0];
++                ptq1r_decode_ref(b, r, codes);
++                int isum = 0;
++                for (int j = 0; j < QK_PQ2_0; j++) isum += codes[j] * q8[j];
++                sumf[r] += GGML_CPU_FP16_TO_FP32(b->d[r]) * yb->d * (float) (isum - ysum);
++            }
++        }
++        for (int r = 0; r < 4; r++) s[4 * x + r] = sumf[r];
++#endif
++    }
++}
++
++// 4 rows x 2 tokens: every decoded code vector is used for both tokens (prompt processing is compute-bound).
++static void ggml_gemm_ptq1_0_4r_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx,
++                                     const void * GGML_RESTRICT vy, int nr, int nc) {
++    assert(n % QK_K == 0 && nc % 4 == 0 && nr % 2 == 0);
++    const int nb  = n / QK_PQ2_0;
++    const int nbk = n / QK_K;
++#if defined(__aarch64__) && defined(__ARM_NEON)
++    for (int c = 0; c < nr; c += 2) {
++        const block_q8_K * GGML_RESTRICT y0 = (const block_q8_K *) vy + (size_t) c * nbk;
++        const block_q8_K * GGML_RESTRICT y1 = y0 + nbk;
++        for (int x = 0; x < nc / 4; x++) {
++            const block_ptq1_0x4r * GGML_RESTRICT b = ptq1r_group(vx, x, nb);
++            float32x4_t s0 = vdupq_n_f32(0.0f), s1 = vdupq_n_f32(0.0f);
++            for (int i = 0; i < nb; i++, b++) {
++                const block_q8_K * GGML_RESTRICT yb0 = &y0[i >> 1];
++                const block_q8_K * GGML_RESTRICT yb1 = &y1[i >> 1];
++                const int8_t * GGML_RESTRICT q80 = yb0->qs + 128 * (i & 1);
++                const int8_t * GGML_RESTRICT q81 = yb1->qs + 128 * (i & 1);
++                int32x4_t a0[4], a1[4];
++                for (int r = 0; r < 4; r += 2) {
++                    uint8x16_t e[2][3];
++                    ptq1r_decode_pair_tail(b, r, e);
++                    for (int p = 0; p < 2; p++) {
++                        const uint8x16_t q = vld1q_u8(b->s16 + 16 * (r + p));
++                        int32x4_t u = vdupq_n_s32(0), v = vdupq_n_s32(0);
++                        static const uint8_t pw[5] = {1, 3, 9, 27, 81};
++                        for (int k = 0; k < 5; k++) {
++                            const int8x16_t w = vreinterpretq_s8_u8(PTQ1R_TRIT(k ? vmulq_u8(q, vdupq_n_u8(pw[k])) : q));
++                            u = ggml_vdotq_s32(u, w, vld1q_s8(q80 + 16 * k));
++                            v = ggml_vdotq_s32(v, w, vld1q_s8(q81 + 16 * k));
++                        }
++                        for (int k = 0; k < 3; k++) {
++                            u = ggml_vdotq_s32(u, vreinterpretq_s8_u8(e[p][k]), vld1q_s8(q80 + 80 + 16 * k));
++                            v = ggml_vdotq_s32(v, vreinterpretq_s8_u8(e[p][k]), vld1q_s8(q81 + 80 + 16 * k));
++                        }
++                        a0[r + p] = u; a1[r + p] = v;
++                    }
++                }
++                s0 = ptq1r_accumulate(s0, b, yb0, i & 1, a0);
++                s1 = ptq1r_accumulate(s1, b, yb1, i & 1, a1);
++            }
++            vst1q_f32(s + (size_t) c * bs + 4 * x, s0);
++            vst1q_f32(s + (size_t) (c + 1) * bs + 4 * x, s1);
++        }
++    }
++#else
++    for (int c = 0; c < nr; c++) {
++        ggml_gemv_ptq1_0_4r_q8_K(n, s + (size_t) c * bs, 0, vx, (const block_q8_K *) vy + (size_t) c * nbk, 1, nc);
++    }
++#endif
++}
++
+ static block_q8_0x16 make_block_q8_0x16(block_q8_0 * in, unsigned int blck_size_interleave) {
+     block_q8_0x16 out;
+ 
+@@ -4802,6 +5040,22 @@ template <> int repack<block_pq2_0x4r, 16, 4>(struct ggml_tensor * t, const void
+     return repack_pq2_0_to_pq2_0_4r(t, data, data_size);
+ }
+ 
++void * bonsai_pq2_0_4x16_traits();
++
++// ternary layout requested: encode losslessly if every code of the tensor is in {0,1,2}, otherwise switch this
++// tensor to the 2-bit 4-row layout (same row grouping, larger blocks, fits the same allocation)
++template <> int repack<block_ptq1_0x4r, 16, 4>(struct ggml_tensor * t, const void * data, size_t data_size) {
++    if (t->ne[1] % 4 != 0 || t->ne[0] % QK_K != 0) {
++        return -1;
++    }
++    if (!pq2_0_tensor_is_ternary((const block_pq2_0 *) data, ggml_nrows(t) * (t->ne[0] / QK_PQ2_0))) {
++        GGML_LOG_INFO("%s: %s has +2 codes, keeping the 2-bit 4-row layout\n", __func__, t->name);
++        t->extra = bonsai_pq2_0_4x16_traits();
++        return repack_pq2_0_to_pq2_0_4r(t, data, data_size);
++    }
++    return repack_pq2_0_to_ptq1_0_4r(t, data, data_size);
++}
++
+ #if defined __riscv_zvfh
+ template <> int repack<block_q4_0, 1, 16>(struct ggml_tensor * t, const void * data, size_t data_size) {
+     return repack_q4_0_to_q4_0_16_bl(t, 1, data, data_size);
+@@ -4915,6 +5169,10 @@ template <> void gemv<block_pq2_0x4r, 16, 4, GGML_TYPE_Q8_K>(int n, float * s, s
+     ggml_gemv_pq2_0_4x16_q8_K(n, s, bs, vx, vy, nr, nc);
+ }
+ 
++template <> void gemv<block_ptq1_0x4r, 16, 4, GGML_TYPE_Q8_K>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
++    ggml_gemv_ptq1_0_4r_q8_K(n, s, bs, vx, vy, nr, nc);
++}
++
+ #if defined __riscv_zvfh
+ template <> void gemv<block_q4_0, 1, 16, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+     ggml_gemv_q4_0_16x1_q8_0(n, s, bs, vx, vy, nr, nc);
+@@ -5028,6 +5286,10 @@ template <> void gemm<block_pq2_0x4r, 16, 4, GGML_TYPE_Q8_K>(int n, float * s, s
+     ggml_gemm_pq2_0_4x16_q8_K(n, s, bs, vx, vy, nr, nc);
+ }
+ 
++template <> void gemm<block_ptq1_0x4r, 16, 4, GGML_TYPE_Q8_K>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
++    ggml_gemm_ptq1_0_4r_q8_K(n, s, bs, vx, vy, nr, nc);
++}
++
+ #if defined __riscv_zvfh
+ template <> void gemm<block_q4_0, 1, 16, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+     ggml_gemm_q4_0_16x1_q8_0(n, s, bs, vx, vy, nr, nc);
+@@ -5419,6 +5681,15 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
+     }
+ };
+ 
++void * bonsai_pq2_0_4x16_traits() {
++    static const tensor_traits<block_pq2_0x4r, 16, 4, GGML_TYPE_Q8_K> t;
++    return (void *) static_cast<const ggml::cpu::tensor_traits *>(&t);
++}
++
++static const ggml::cpu::tensor_traits * bonsai_ptq1_0_4r_traits() {
++    static const tensor_traits<block_ptq1_0x4r, 16, 4, GGML_TYPE_Q8_K> t;
++    return &t;
++}
+ }  // namespace ggml::cpu::repack
+ 
+ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(const struct ggml_tensor * cur) {
+@@ -5460,7 +5731,6 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
+ 
+     // instance for Q2_0
+     static const ggml::cpu::repack::tensor_traits<block_pq2_0, 8, 4, GGML_TYPE_Q8_0> pq2_0_4x8_q8_0;
+-    static const ggml::cpu::repack::tensor_traits<block_pq2_0x4r, 16, 4, GGML_TYPE_Q8_K> pq2_0_4x16_q8_K;
+ 
+     // instances for RISC-V
+     //
+@@ -5657,9 +5927,16 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
+             const char * e = getenv("BONSAI_PQ2_REPACK");
+             return !(e && e[0] == '0');
+         }();
++        static const bool bonsai_pq2_ternary = [] {
++            const char * e = getenv("BONSAI_PQ2_TERNARY");
++            return e && e[0] == '1';
++        }();
+         if (bonsai_pq2_repack && ggml_cpu_has_neon() && cur->ne[1] % 4 == 0 && cur->ne[0] % QK_K == 0 &&
+             cur->ne[2] == 1 && cur->ne[3] == 1) {
+-            return &pq2_0_4x16_q8_K;
++            if (bonsai_pq2_ternary) {
++                return ggml::cpu::repack::bonsai_ptq1_0_4r_traits();
++            }
++            return (const ggml::cpu::tensor_traits *) ggml::cpu::repack::bonsai_pq2_0_4x16_traits();
+         }
+ #endif
+     }
+diff --git a/ggml/src/ggml-cpu/repack.h b/ggml/src/ggml-cpu/repack.h
+index 78098e0..b7c6c2f 100644
+--- a/ggml/src/ggml-cpu/repack.h
++++ b/ggml/src/ggml-cpu/repack.h
+@@ -57,6 +57,15 @@ struct block_pq2_0x4r {
+ };
+ static_assert(sizeof(block_pq2_0x4r) == 4 * sizeof(block_pq2_0), "wrong block_pq2_0x4r size/padding");
+ 
++// Bonsai-Oryon: the same 4 rows, ternary (PTQ1_0 trit packing), 1.75 bpw; opt-in via BONSAI_PQ2_TERNARY=1
++struct block_ptq1_0x4r {
++    ggml_half d[4];
++    uint8_t   s16[4 * 16];   // stage 1 per row: 16 bytes x 5 trits = weights 0..79
++    uint8_t   s8[4 * 8];     // stage 2 per row:  8 bytes x 5 trits = weights 80..119
++    uint8_t   tail[4 * 2];   // tail per row:     2 bytes x 4 trits = weights 120..127
++};
++static_assert(sizeof(block_ptq1_0x4r) == 4 * (sizeof(ggml_half) + 26), "wrong block_ptq1_0x4r size/padding");
++
+ struct block_q4_Kx8 {
+     ggml_half d[8];      // super-block scale for quantized scales
+     ggml_half dmin[8];   // super-block scale for quantized mins

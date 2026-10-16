@@ -6,7 +6,8 @@
 # Every experiment uses CPU only (-ngl 0), the same model file and -r 3 repetitions (tokens/s +- stddev):
 #   E0  bonsai-diag: DRAM read bandwidth vs tg-shaped PQ2_0 GEMV throughput (is decoding memory-bound?)
 #   E1  tg128 + pp256 thread sweep 4/6/7/8 with the default (v0.2) kernels
-#   E2  v0.2 4-row PQ2_0 layout vs v0.1 kernel path (BONSAI_PQ2_REPACK=0) at 8 threads and the best E1 count
+#   E2  v0.2 4-row PQ2_0 layout vs v0.1 kernel path (BONSAI_PQ2_REPACK=0) vs opt-in lossless ternary 4-row
+#       layout (BONSAI_PQ2_TERNARY=1, 17.6% fewer bytes per token) at 8 threads and the best E1 count
 #   E3  OpenMP thread placement: default vs OMP_PROC_BIND=close/OMP_PLACES=cores vs OMP_WAIT_POLICY=active
 #   E4  optional (-b): the same settings with your previous llama-bench build
 # --quick: fewer threads/variants (about 5 minutes instead of about 20). Results: <OUTDIR>/report.md + raw JSON.
@@ -74,6 +75,8 @@ if [ -x "$DIAG" ]; then
     echo ">> E0 bonsai-diag" >&2
     { echo "## E0. Memory bandwidth vs PQ2_0 GEMV (bonsai-diag)"; echo; echo '```'; } >> "$R"
     "$DIAG" "$NCPU" $([ $QUICK = 1 ] && echo --quick) 2>&1 | tee "$OUT/diag.txt" >> "$R"
+    echo "--- ternary 4-row layout (BONSAI_PQ2_TERNARY=1)" >> "$R"
+    BONSAI_PQ2_TERNARY=1 "$DIAG" "$NCPU" --quick 2>&1 | grep -E '^\[gemv\]' | tee "$OUT/diag-ternary.txt" >> "$R"
     { echo '```'; echo; } >> "$R"
 else
     echo "(bonsai-diag not found at $DIAG; skipping E0)" >> "$R"
@@ -115,10 +118,11 @@ echo >> "$R"; echo "Best tg thread count: **$BEST**" >> "$R"; echo >> "$R"
 snapshot_freqs "after E1"
 
 # ---- E2: 4-row layout on/off
-{ echo "## E2. v0.2 4-row PQ2_0 layout vs v0.1 kernel path"; echo; } >> "$R"; table_head
+{ echo "## E2. v0.2 4-row PQ2_0 layout vs v0.1 kernel path vs opt-in ternary layout"; echo; } >> "$R"; table_head
 TS2=$(printf '%s\n' 8 "$BEST" | sort -un | paste -sd,)
 run_bench e2-v02-4row  "$BENCH" "$TS2" "$PP" "$TG"
 run_bench e2-v01-plain "$BENCH" "$TS2" "$PP" "$TG" BONSAI_PQ2_REPACK=0
+run_bench e2-v02-ternary "$BENCH" "$TS2" "$PP" "$TG" BONSAI_PQ2_TERNARY=1
 echo >> "$R"
 
 # ---- E3: OpenMP placement / waiting

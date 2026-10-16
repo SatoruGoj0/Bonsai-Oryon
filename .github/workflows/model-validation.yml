@@ -74,16 +74,21 @@ jobs:
           echo "### real-model numerical compatibility, v0.2 default kernels vs unpatched e3de715 kernels" > results/real-numerics.md
           BASE_BACKEND_DIR=$PWD/base/bin OPT_BACKEND_DIR=$PWD/opt/bin THREADS=4 CTX=256 CHUNKS=4 MAX_KLD=0.001 MIN_TOP1=98 \
             tests/numerics/compare-kld.sh base/bin/llama-perplexity opt/bin/llama-perplexity /models/bonsai.gguf /tmp/text.txt results/real-numerics.md
+      - name: numerical compatibility, opt-in ternary layout vs unpatched kernels
+        run: |
+          echo "### real-model numerical compatibility, ternary 4-row layout (BONSAI_PQ2_TERNARY=1) vs unpatched e3de715 kernels" > results/real-numerics-ternary.md
+          BONSAI_PQ2_TERNARY=1 BASE_BACKEND_DIR=$PWD/base/bin OPT_BACKEND_DIR=$PWD/opt/bin THREADS=4 CTX=256 CHUNKS=4 MAX_KLD=0.001 MIN_TOP1=98 \
+            tests/numerics/compare-kld.sh base/bin/llama-perplexity opt/bin/llama-perplexity /models/bonsai.gguf /tmp/text.txt results/real-numerics-ternary.md
       - name: A/B on the real model, threads 1/2/4 (runner CPU, 3 reps)
         run: |
           R=results/real-ab.md
           { echo "### real-model A/B, $(lscpu | sed -n 's/^Model name: *//p' | head -1), $(nproc) vCPU - NOT Snapdragon X"; echo
             echo "| build | threads | pp256 tok/s | tg128 tok/s |"; echo "|---|---|---|---|"; } > $R
           ab() { # label dir env...
-            l=$1; d=$2; shift 2
+            lab=$1; d=$2; shift 2; l=$(echo "$lab" | tr -c 'A-Za-z0-9\n' '_')
             env "$@" LD_LIBRARY_PATH=$PWD/$d/bin BONSAI_BACKEND_DIR=$PWD/$d/bin $d/bin/llama-bench -m /models/bonsai.gguf \
               -t 1,2,4 -ngl 0 -p 256 -n 128 -r 3 -o json > /tmp/$l.json 2>/tmp/$l.log || { tail /tmp/$l.log; return 1; }
-            python3 - /tmp/$l.json "$l" >> $R <<'PY'
+            python3 - /tmp/$l.json "$lab" >> $R <<'PY'
           import json, sys
           rows = {}
           for r in json.load(open(sys.argv[1])):
@@ -94,6 +99,7 @@ jobs:
           ab "upstream kernels (e3de715 + 0003/0004)" base
           ab "v0.1 path (BONSAI_PQ2_REPACK=0)" opt BONSAI_PQ2_REPACK=0
           ab "v0.2 4-row layout (default)" opt
+          ab "v0.2 ternary 4-row (BONSAI_PQ2_TERNARY=1)" opt BONSAI_PQ2_TERNARY=1
           cat $R
       - if: always()
         run: cat results/*.md >> "$GITHUB_STEP_SUMMARY"
@@ -117,13 +123,14 @@ jobs:
           set -e
           apt-get update -qq && apt-get install -y -qq --no-install-recommends linux-perf libgomp1 >/dev/null
           export LD_LIBRARY_PATH=/w/opt/bin BONSAI_BACKEND_DIR=/w/opt/bin
-          for v in v02:1 v01:0; do
-            n=${v%%:*}; BONSAI_PQ2_REPACK=${v#*:} perf record -q -F 1999 -o /w/$n.data -- \
+          for v in v02:1:0 v01:0:0 v02ternary:1:1; do
+            n=${v%%:*}; rt=${v#*:}; BONSAI_PQ2_TERNARY=${rt#*:} BONSAI_PQ2_REPACK=${rt%%:*} perf record -q -F 1999 -o /w/$n.data -- \
               /w/opt/bin/llama-bench -m /w/model.gguf -t 4 -ngl 0 -p 0 -n 64 -r 1 >/w/$n.bench 2>&1
-            echo "### $n (BONSAI_PQ2_REPACK=${v#*:}): top symbols, tg64, 4 threads"
+            echo "### $n (BONSAI_PQ2_REPACK=${rt%%:*} BONSAI_PQ2_TERNARY=${rt#*:}): top symbols and DSOs, tg64, 4 threads"
             grep -E '^\|' /w/$n.bench | tail -1
             echo '```'
-            perf report -q -i /w/$n.data --no-children --sort symbol --stdio 2>/dev/null | grep -v '^$' | head -30
+            perf report -q -i /w/$n.data --no-children --sort dso --stdio 2>/dev/null | grep -v '^$' | cut -c1-120 | head -8
+            perf report -q -i /w/$n.data --no-children --sort symbol --stdio 2>/dev/null | grep -v '^$' | cut -c1-140 | head -25
             echo '```'
           done
           EOF

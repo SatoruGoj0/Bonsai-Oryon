@@ -6,7 +6,8 @@
 //
 // 1. raw DRAM read bandwidth with 1..N threads (1 GiB buffer, streaming 64-bit sums)
 // 2. tg-shaped PQ2_0 mul_mat (one activation column) on a 4096 x 65536 matrix (71 MB, beyond any cache),
-//    plain layout vs Bonsai-Oryon 4-row layout, 1..N threads, reported as GB/s of weights streamed
+//    plain layout vs Bonsai-Oryon 4-row layout (ternary layout with BONSAI_PQ2_TERNARY=1), 1..N threads,
+//    reported as GB/s of PQ2_0-equivalent weights (2.125 bpw) streamed
 // 3. what that implies for Ternary-Bonsai-2-9B (about 1.97 GB of PQ2_0 weights read per generated token)
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -94,7 +95,10 @@ int main(int argc, char ** argv) {
     for (size_t i = 0; i < wbytes; i += 34) {
         const uint16_t d = 0x2000 + (rng() & 0x3ff);           // fp16 scale ~0.008
         memcpy(&wq[i], &d, 2);
-        for (int j = 2; j < 34; j++) wq[i + j] = (uint8_t) rng();
+        for (int j = 2; j < 34; j++) {   // ternary codes {0,1,2}, like Ternary-Bonsai, so either 4-row layout applies
+            uint8_t q = 0; for (int k = 0; k < 4; k++) q |= (uint8_t) ((rng() % 3) << (2 * k));
+            wq[i + j] = q;
+        }
     }
     struct W { ggml_context * ctx; ggml_backend_buffer_t buf; ggml_tensor * t; };
     auto make_w = [&](ggml_backend_buffer_type_t bt) {
@@ -109,7 +113,8 @@ int main(int argc, char ** argv) {
     layouts.push_back({"plain (v0.1)", make_w(ggml_backend_dev_buffer_type(dev))});
     if (repack) {
         W r = make_w(repack);
-        if (r.t->extra) layouts.push_back({"4-row (v0.2)", r});
+        const char * te = getenv("BONSAI_PQ2_TERNARY");
+        if (r.t->extra) layouts.push_back({te && te[0] == '1' ? "4-row ternary (opt-in)" : "4-row (v0.2)", r});
         else { printf("\n(4-row layout not available on this CPU/build)\n"); ggml_backend_buffer_free(r.buf); ggml_free(r.ctx); }
     }
     std::vector<float> act(K);
