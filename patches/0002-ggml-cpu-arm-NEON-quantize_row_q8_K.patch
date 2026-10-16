@@ -1,0 +1,82 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 16 Oct 2026 09:47:24 +0000
+Subject: [PATCH] ggml-cpu: arm: NEON quantize_row_q8_K
+
+Vectorised port of quantize_row_q8_K_ref (previously the scalar reference on
+all ARM targets). Output is bit-identical to the reference as compiled by GCC
+(-ffp-contract=fast fuses iscale*x + magic into one FMA, which is mirrored with
+FMLA). All-zero blocks additionally get zeroed bsums.
+
+Part of Bonsai-Oryon (https://github.com/SatoruGoj0/Bonsai-Oryon).
+---
+ ggml/src/ggml-cpu/arch/arm/quants.c | 56 +++++++++++++++++++++++++++--
+ 1 file changed, 54 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-cpu/arch/arm/quants.c b/ggml/src/ggml-cpu/arch/arm/quants.c
+index 0df838ecc..85e233526 100644
+--- a/ggml/src/ggml-cpu/arch/arm/quants.c
++++ b/ggml/src/ggml-cpu/arch/arm/quants.c
+@@ -131,8 +131,60 @@ void quantize_row_q8_1(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, i
+ }
+ 
+ // placeholder implementation for Apple targets
+-void quantize_row_q8_K(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+-    quantize_row_q8_K_ref(x, y, k);
++void quantize_row_q8_K(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
++#if defined(__aarch64__) && defined(__ARM_NEON)
++    // Bonsai-Oryon: NEON port of quantize_row_q8_K_ref with bit-identical output for finite inputs.
++    // - max is the FIRST element whose |x| equals the block's max |x| (ref uses a strict '>' scan);
++    // - nearest_int(iscale*x) is reproduced with the same magic-number trick (x*iscale + 1.5*2^23, keep the
++    //   mantissa). GCC compiles the reference with -ffp-contract=fast, i.e. as ONE fused multiply-add, so
++    //   FMLA is used here too; a separate multiply + FCVTNS would differ from the reference on rare ties;
++    // - the ref clamps at +127 only; |iscale*x| <= 127 (+rounding) so the saturating narrows are equivalent.
++    // NaNs are skipped by FMAXNM exactly like the ref's '>' comparison skips them.
++    assert(k % QK_K == 0);
++    const int64_t nb = k / QK_K;
++    block_q8_K * GGML_RESTRICT y = vy;
++
++    for (int64_t i = 0; i < nb; i++, x += QK_K) {
++        float32x4_t vmax = vdupq_n_f32(0.0f);
++        for (int j = 0; j < QK_K; j += 16) {
++            const float32x4_t a = vmaxnmq_f32(vabsq_f32(vld1q_f32(x + j)),      vabsq_f32(vld1q_f32(x + j + 4)));
++            const float32x4_t b = vmaxnmq_f32(vabsq_f32(vld1q_f32(x + j + 8)),  vabsq_f32(vld1q_f32(x + j + 12)));
++            vmax = vmaxnmq_f32(vmax, vmaxnmq_f32(a, b));
++        }
++        const float amax = vmaxnmvq_f32(vmax);
++        if (!amax) {
++            y[i].d = 0;
++            memset(y[i].qs, 0, QK_K);
++            memset(y[i].bsums, 0, sizeof(y[i].bsums));
++            continue;
++        }
++        float max = 0.0f;
++        for (int j = 0; j < QK_K; ++j) {
++            if (fabsf(x[j]) == amax) { max = x[j]; break; }
++        }
++        const float iscale = -127.f/max;
++        const float32x4_t vs    = vdupq_n_f32(iscale);
++        const float32x4_t magic = vdupq_n_f32(12582912.f);
++        const int32x4_t   mmask = vdupq_n_s32(0x007fffff);
++        const int32x4_t   moff  = vdupq_n_s32(0x00400000);
++#define Q8K_NEAREST(v) vsubq_s32(vandq_s32(vreinterpretq_s32_f32(vfmaq_f32(magic, (v), vs)), mmask), moff)
++        for (int j = 0; j < QK_K; j += 16) {
++            const int32x4_t i0 = Q8K_NEAREST(vld1q_f32(x + j +  0));
++            const int32x4_t i1 = Q8K_NEAREST(vld1q_f32(x + j +  4));
++            const int32x4_t i2 = Q8K_NEAREST(vld1q_f32(x + j +  8));
++            const int32x4_t i3 = Q8K_NEAREST(vld1q_f32(x + j + 12));
++            const int16x8_t h0 = vcombine_s16(vqmovn_s32(i0), vqmovn_s32(i1));
++            const int16x8_t h1 = vcombine_s16(vqmovn_s32(i2), vqmovn_s32(i3));
++            const int8x16_t q  = vcombine_s8(vqmovn_s16(h0), vqmovn_s16(h1));
++            vst1q_s8(y[i].qs + j, q);
++            y[i].bsums[j / 16] = (int16_t) vaddlvq_s8(q);
++        }
++#undef Q8K_NEAREST
++        y[i].d = 1/iscale;
++    }
++#else
++    quantize_row_q8_K_ref(x, vy, k);
++#endif
+ }
+ 
+ //===================================== Dot products =================================

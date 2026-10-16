@@ -1,0 +1,9 @@
+bonsai-oryon (0.1.0) experimental; urgency=low
+
+  * Initial release: PrismML llama.cpp e3de715 + Bonsai-Oryon patches 0001-0004.
+  * NEON PQ2_0 x Q8_K kernel (de-interleaved decode, bsums offset folding, 2x2 tile).
+  * NEON quantize_row_q8_K, bit-identical to the reference.
+  * armv8.6_nosve CPU variant so Snapdragon X (I8MM, no SVE) gets I8MM kernels.
+  * Backends load only from /usr/lib/bonsai-oryon.
+
+ -- SatoruGoj0 <SatoruGoj0@users.noreply.github.com>  Fri, 16 Oct 2026 12:00:00 +0000

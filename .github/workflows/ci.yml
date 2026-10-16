@@ -1,0 +1,261 @@
+name: build-test-release
+
+# Builds the CPU-only ARM64 engine inside Debian 13 (trixie) on GitHub's native ARM64 runners, runs
+# the kernel, functional, numerical and package tests, builds bonsai-oryon_<ver>_arm64.deb and - only
+# when explicitly requested (manual run with publish=true, or a pushed v* tag) and every test job
+# passed - publishes a GitHub Release with the .deb, checksums and test results.
+#
+# NOTE: these runners are generic Arm Neoverse servers. They establish functional correctness, not
+# Snapdragon X performance; performance numbers in this workflow are labelled with the runner CPU.
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Publish GitHub Release v0.1.0 (pre-release) if all tests pass'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  DEBIAN_FRONTEND: noninteractive
+  BUILD_DEPS: git ca-certificates build-essential cmake ninja-build python3 file dpkg-dev patchelf
+
+jobs:
+  kernel-tests:
+    name: kernel tests (${{ matrix.name }})
+    runs-on: ubuntu-24.04-arm
+    container: debian:trixie
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: armv8.0 no-dotprod fallback, arch: armv8-a }
+          - { name: armv8.2 dotprod+fp16,        arch: armv8.2-a+dotprod+fp16 }
+          - { name: armv8.6 i8mm no-SVE (Oryon ISA), arch: armv8.6-a+dotprod+fp16+i8mm+nosve }
+    steps:
+      - run: apt-get update -qq && apt-get install -y -qq --no-install-recommends $BUILD_DEPS
+      - uses: actions/checkout@v4
+        with: { submodules: true }
+      - run: git config --global --add safe.directory '*'
+      - run: scripts/prepare-source.sh
+      - name: build kernel tests
+        run: |
+          cmake -S tests/kernels -B kt -G Ninja -DCMAKE_BUILD_TYPE=Release \
+                -DLLAMA_SRC="$PWD/build/src" -DKTEST_ARCH='${{ matrix.arch }}'
+          cmake --build kt -j "$(nproc)"
+      - name: run kernel tests
+        run: |
+          set -o pipefail
+          mkdir -p results
+          { echo "### kernel tests: ${{ matrix.name }} (-march=${{ matrix.arch }})"; echo; echo '```'
+            echo "runner cpu: $(lscpu | sed -n 's/^Model name: *//p' | head -1); features: $(grep -m1 Features /proc/cpuinfo | cut -d: -f2)"
+            ./kt/test-pq2-kernels --bench
+            echo "--- upstream test-quantize-fns"; ./kt/test-quantize-fns
+            echo "--- upstream test-pq2-row-shapes"; ./kt/test-pq2-row-shapes
+            echo '```'; } 2>&1 | tee "results/kernel-${{ strategy.job-index }}.md"
+          cat "results/kernel-${{ strategy.job-index }}.md" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: 'results-kernel-${{ strategy.job-index }}', path: results/ }
+
+  build:
+    runs-on: ubuntu-24.04-arm
+    container: debian:trixie
+    steps:
+      - run: apt-get update -qq && apt-get install -y -qq --no-install-recommends $BUILD_DEPS python3-numpy
+      - uses: actions/checkout@v4
+        with: { submodules: true }
+      - run: git config --global --add safe.directory '*'
+      - run: scripts/prepare-source.sh
+      - run: scripts/build.sh
+      - name: build Debian package
+        run: packaging/build-deb.sh build/release build/dist
+      - name: check package metadata and contents
+        run: |
+          set -e
+          deb=build/dist/bonsai-oryon_0.1.0_arm64.deb
+          dpkg-deb --info "$deb"
+          dpkg-deb --contents "$deb"
+          f() { dpkg-deb --field "$deb" "$1"; }
+          [ "$(f Package)" = bonsai-oryon ] && [ "$(f Version)" = 0.1.0 ] && [ "$(f Architecture)" = arm64 ]
+          f Depends | grep -q libc6
+          # only the expected locations, no maintainer scripts, no systemd units
+          bad=$(dpkg-deb --contents "$deb" | awk '{print $6}' | grep -vE '^\./(usr/bin/bonsai-(cli|server|bench)|usr/lib/bonsai-oryon/.*|usr/share/doc/bonsai-oryon/.*|usr/share/bonsai-oryon/.*|usr/|usr/bin/|usr/lib/|usr/share/|usr/share/doc/)?$' || true)
+          if [ -n "$bad" ]; then echo "unexpected paths: $bad"; exit 1; fi
+          if dpkg-deb --contents "$deb" | grep -qiE 'systemd|\.service'; then echo "service files found"; exit 1; fi
+          if dpkg-deb --ctrl-tarfile "$deb" | tar -t | grep -qE 'preinst|postinst|prerm|postrm'; then echo "maintainer scripts found"; exit 1; fi
+          # CPU-specific instructions (dotprod/i8mm/SVE/SME) may only appear in the runtime-dispatched
+          # libggml-cpu-<variant> modules, never in executables, libllama, libggml or the armv8.0 module
+          mkdir -p x && dpkg-deb -x "$deb" x
+          for b in x/usr/bin/bonsai-* x/usr/lib/bonsai-oryon/bin/* x/usr/lib/bonsai-oryon/lib*.so.* x/usr/lib/bonsai-oryon/libggml-cpu-armv8.0_1.so; do
+            n=$(objdump -d "$b" | grep -cE '\s(sdot|udot|usdot|smmla|ummla|whilelo|ptrue|smstart)\s' || true)
+            echo "$(basename "$b"): $n feature-specific instructions"
+            [ "$n" -eq 0 ] || { echo "ISA leak in $b"; exit 1; }
+          done
+          for v in x/usr/lib/bonsai-oryon/libggml-cpu-*.so; do
+            echo "$(basename "$v"): sdot=$(objdump -d "$v" | grep -cE '\ssdot\s') smmla=$(objdump -d "$v" | grep -cE '\ssmmla\s')"
+          done
+          readelf -d x/usr/bin/bonsai-cli | grep -E 'RPATH|RUNPATH|NEEDED'
+      - name: create test fixtures (synthetic tiny model, PQ2_0)
+        run: |
+          set -e
+          mkdir -p fixtures
+          python3 tests/fixtures/make_tiny_model.py build/src/gguf-py fixtures/tiny-f32.gguf
+          BONSAI_BACKEND_DIR=$PWD/build/release/bin build/release/bin/llama-quantize fixtures/tiny-f32.gguf fixtures/tiny-pq2_0.gguf PQ2_0
+          python3 -c "import sys; sys.path.insert(0,'build/src/gguf-py'); import gguf; r=gguf.GGUFReader('fixtures/tiny-pq2_0.gguf'); import collections; print(collections.Counter(t.tensor_type.name for t in r.tensors))"
+          # evaluation text restricted to characters in the tiny vocab (it has no byte-fallback tokens)
+          cat build/src/LICENSE build/src/README.md | tr -cd "A-Za-z0-9.,!?;:'\"()\n -" > fixtures/sample.txt
+      - name: pack build tree
+        run: tar -C build/release -czf engine-bin.tgz bin
+      - uses: actions/upload-artifact@v4
+        with: { name: deb, path: 'build/dist/*' }
+      - uses: actions/upload-artifact@v4
+        with: { name: engine-bin, path: engine-bin.tgz }
+      - uses: actions/upload-artifact@v4
+        with: { name: fixtures, path: fixtures/ }
+
+  baseline:
+    name: baseline build (unpatched kernels)
+    runs-on: ubuntu-24.04-arm
+    container: debian:trixie
+    steps:
+      - run: apt-get update -qq && apt-get install -y -qq --no-install-recommends $BUILD_DEPS
+      - uses: actions/checkout@v4
+        with: { submodules: true }
+      - run: git config --global --add safe.directory '*'
+      - run: PATCH_SET=baseline scripts/prepare-source.sh
+      - run: BUILD_TARGETS="llama-perplexity llama-bench llama-cli" scripts/build.sh
+      - run: tar -C build/release -czf baseline-bin.tgz bin
+      - uses: actions/upload-artifact@v4
+        with: { name: baseline-bin, path: baseline-bin.tgz }
+
+  functional:
+    name: functional + numerical tests (build tree)
+    needs: [build, baseline]
+    runs-on: ubuntu-24.04-arm
+    container: debian:trixie
+    steps:
+      - run: apt-get update -qq && apt-get install -y -qq --no-install-recommends git ca-certificates python3 curl iproute2 libgomp1
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: engine-bin }
+      - uses: actions/download-artifact@v4
+        with: { name: baseline-bin }
+      - uses: actions/download-artifact@v4
+        with: { name: fixtures, path: fixtures }
+      - run: mkdir -p opt base && tar -C opt -xzf engine-bin.tgz && tar -C base -xzf baseline-bin.tgz
+      - name: functional tests (CLI, bench, server/OpenAI API, CPU detection)
+        run: |
+          mkdir -p results; echo "### functional tests (build tree, runner: $(lscpu | sed -n 's/^Model name: *//p' | head -1))" > results/functional.md
+          BONSAI_BACKEND_DIR=$PWD/opt/bin THREADS=4 tests/functional/run-functional.sh opt/bin fixtures/tiny-pq2_0.gguf results/functional.md
+      - name: numerical compatibility vs unpatched upstream kernels (KL divergence)
+        run: |
+          echo "### numerical compatibility (tiny synthetic PQ2_0 model, full-vocab logits)" > results/numerics.md
+          BASE_BACKEND_DIR=$PWD/base/bin OPT_BACKEND_DIR=$PWD/opt/bin THREADS=4 \
+            tests/numerics/compare-kld.sh base/bin/llama-perplexity opt/bin/llama-perplexity fixtures/tiny-pq2_0.gguf fixtures/sample.txt results/numerics.md
+      - name: A/B throughput on the tiny model (CI runner, NOT Snapdragon X)
+        run: |
+          set -e
+          { echo "### A/B throughput, tiny synthetic model, $(lscpu | sed -n 's/^Model name: *//p' | head -1), 4 threads"; echo; } > results/ab-tiny.md
+          for v in base opt; do
+            BONSAI_BACKEND_DIR=$PWD/$v/bin $v/bin/llama-bench -m fixtures/tiny-pq2_0.gguf -t 4 -ngl 0 -p 256 -n 128 -r 3 -o md | tee -a results/ab-tiny.md
+            echo >> results/ab-tiny.md
+          done
+      - if: always()
+        run: cat results/*.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: results-functional, path: results/ }
+
+  package-test:
+    name: Debian package install/remove (clean trixie)
+    needs: build
+    runs-on: ubuntu-24.04-arm
+    container: debian:trixie
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: deb, path: dist }
+      - uses: actions/download-artifact@v4
+        with: { name: fixtures, path: fixtures }
+      - name: install with apt (dependencies resolved from Debian 13)
+        run: |
+          set -e
+          mkdir -p results; R=results/package.md
+          echo "### Debian package test (clean debian:trixie container)" > $R; echo >> $R
+          (cd dist && sha256sum -c bonsai-oryon_0.1.0_arm64.deb.sha256) | tee -a $R
+          apt-get update -qq
+          apt-get install -y -qq ./dist/bonsai-oryon_0.1.0_arm64.deb
+          apt-get install -y -qq --no-install-recommends python3 curl iproute2
+          for b in bonsai-cli bonsai-server bonsai-bench; do test -x /usr/bin/$b; done
+          if ldd /usr/bin/bonsai-* /usr/lib/bonsai-oryon/*.so* | grep 'not found'; then exit 1; fi
+          echo "- installed files: $(dpkg -L bonsai-oryon | wc -l), Depends: $(dpkg-query -W -f='${Depends}' bonsai-oryon)" >> $R
+          echo "- ldd: all shared libraries resolved" >> $R
+      - name: functional tests against the installed binaries
+        run: |
+          echo >> results/package.md
+          THREADS=4 tests/functional/run-functional.sh /usr/bin fixtures/tiny-pq2_0.gguf results/package.md
+      - name: remove and purge
+        run: |
+          set -e
+          R=results/package.md; echo >> $R
+          apt-get remove -y -qq bonsai-oryon
+          for p in /usr/bin/bonsai-cli /usr/bin/bonsai-server /usr/bin/bonsai-bench /usr/lib/bonsai-oryon; do
+            if [ -e "$p" ]; then echo "left behind: $p"; exit 1; fi
+          done
+          apt-get purge -y -qq bonsai-oryon || true
+          ! dpkg -l bonsai-oryon 2>/dev/null | grep -q '^ii'
+          echo "- \`apt-get remove\`: all package files removed; purge clean" >> $R
+      - if: always()
+        run: cat results/package.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: results-package, path: results/ }
+
+  release:
+    name: publish GitHub Release
+    needs: [kernel-tests, build, functional, package-test]
+    if: (github.event_name == 'workflow_dispatch' && inputs.publish) || startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: deb, path: dist }
+      - uses: actions/download-artifact@v4
+        with: { pattern: 'results-*', path: results, merge-multiple: true }
+      - name: assemble release notes
+        run: |
+          set -e
+          cp packaging/release-notes.md notes.md
+          {
+            echo; echo "## Test results of this build (workflow run ${{ github.run_id }}, commit ${{ github.sha }})"; echo
+            echo "All results below come from GitHub's generic ARM64 runners (Arm Neoverse), i.e. functional validation."
+            echo "They are **not** Snapdragon X performance measurements."; echo
+            for f in results/kernel-*.md results/functional.md results/numerics.md results/ab-tiny.md results/package.md; do [ -f "$f" ] && { cat "$f"; echo; }; done
+            echo "## SHA-256"; echo; echo '```'; cat dist/*.sha256; echo '```'
+          } >> notes.md
+          (cd dist && sha256sum bonsai-oryon_0.1.0_arm64.deb > SHA256SUMS)
+      - name: create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create v0.1.0 \
+            --repo "${{ github.repository }}" \
+            --target "${{ github.sha }}" \
+            --title "Bonsai Oryon v0.1.0 — ARM64 CPU Inference" \
+            --notes-file notes.md \
+            --prerelease \
+            dist/bonsai-oryon_0.1.0_arm64.deb dist/SHA256SUMS dist/bonsai-oryon_0.1.0_arm64.deb.sha256

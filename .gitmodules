@@ -1,0 +1,4 @@
+[submodule "upstream/llama.cpp"]
+	path = upstream/llama.cpp
+	url = https://github.com/PrismML-Eng/llama.cpp.git
+	branch = prism

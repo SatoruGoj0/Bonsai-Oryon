@@ -1,0 +1,78 @@
+name: model-validation (opt-in, real 9B model)
+
+# Manually triggered only. Downloads prism-ml/Ternary-Bonsai-2-9B-gguf / Ternary-Bonsai-2-9B-PQ2_0.gguf
+# (about 2.4 GB) from Hugging Face onto the runner. Nothing is cached, uploaded or redistributed.
+# Justification: the only way to check end-to-end numerical compatibility (KL divergence of
+# full-vocabulary logits) of the optimized kernels against unpatched upstream kernels on the REAL
+# model, and to get a like-for-like A/B (pp256/tg128) on ARM64 hardware. The runner is a generic
+# 4-vCPU Arm Neoverse VM, so these are NOT Snapdragon X numbers.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ci_run_id:
+        description: 'Run ID of a successful build-test-release run whose engine-bin/baseline-bin artifacts to use'
+        required: true
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04-arm
+    container: debian:trixie
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      MODEL_URL: https://huggingface.co/prism-ml/Ternary-Bonsai-2-9B-gguf/resolve/main/Ternary-Bonsai-2-9B-PQ2_0.gguf
+    steps:
+      - run: apt-get update -qq && apt-get install -y -qq --no-install-recommends git ca-certificates python3 python3-numpy curl libgomp1
+      - uses: actions/checkout@v4
+        with: { submodules: true }
+      - uses: actions/download-artifact@v4
+        with: { name: engine-bin, run-id: '${{ inputs.ci_run_id }}', github-token: '${{ github.token }}' }
+      - uses: actions/download-artifact@v4
+        with: { name: baseline-bin, run-id: '${{ inputs.ci_run_id }}', github-token: '${{ github.token }}' }
+      - run: mkdir -p opt base && tar -C opt -xzf engine-bin.tgz && tar -C base -xzf baseline-bin.tgz
+      - name: download model (not redistributed)
+        run: |
+          mkdir -p /models
+          curl -fL --retry 5 -o /models/bonsai.gguf "$MODEL_URL"
+          ls -la /models; sha256sum /models/bonsai.gguf
+      - name: inspect tensor types
+        continue-on-error: true
+        run: |
+          mkdir -p results
+          python3 - <<'PY' | tee results/model-tensors.md
+          import sys, collections
+          sys.path.insert(0, "upstream/llama.cpp/gguf-py")
+          import gguf
+          r = gguf.GGUFReader("/models/bonsai.gguf")
+          arch = r.fields["general.architecture"]; print("architecture:", bytes(arch.parts[arch.data[0]]).decode())
+          by = collections.defaultdict(lambda: [0, 0])
+          for t in r.tensors:
+              by[t.tensor_type.name][0] += 1; by[t.tensor_type.name][1] += int(t.n_bytes)
+          print("| type | tensors | MiB |\n|---|---|---|")
+          for k, (n, b) in sorted(by.items(), key=lambda kv: -kv[1][1]): print(f"| {k} | {n} | {b/2**20:.1f} |")
+          for t in r.tensors:
+              if t.name in ("token_embd.weight", "output.weight"): print(f"- {t.name}: {t.tensor_type.name} {list(t.shape)}")
+          PY
+      - name: numerical compatibility on the real model (KL divergence vs unpatched kernels)
+        run: |
+          cat upstream/llama.cpp/README.md upstream/llama.cpp/docs/build.md > /tmp/text.txt
+          echo "### real-model numerical compatibility (Ternary-Bonsai-2-9B-PQ2_0)" > results/real-numerics.md
+          BASE_BACKEND_DIR=$PWD/base/bin OPT_BACKEND_DIR=$PWD/opt/bin THREADS=4 CTX=256 CHUNKS=4 MAX_KLD=0.001 MIN_TOP1=98 \
+            tests/numerics/compare-kld.sh base/bin/llama-perplexity opt/bin/llama-perplexity /models/bonsai.gguf /tmp/text.txt results/real-numerics.md
+      - name: A/B pp256 / tg128 (runner CPU, 4 threads, 3 reps)
+        run: |
+          { echo "### real-model A/B, $(lscpu | sed -n 's/^Model name: *//p' | head -1), $(nproc) vCPU - NOT Snapdragon X"; echo; } > results/real-ab.md
+          for v in base opt; do
+            echo "#### $v" >> results/real-ab.md
+            BONSAI_BACKEND_DIR=$PWD/$v/bin $v/bin/llama-bench -m /models/bonsai.gguf -t 4 -ngl 0 -p 256 -n 128 -r 3 -o md 2>&1 | grep -E '^\|' | tee -a results/real-ab.md
+            echo >> results/real-ab.md
+          done
+      - if: always()
+        run: cat results/*.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: real-model-results, path: results/ }

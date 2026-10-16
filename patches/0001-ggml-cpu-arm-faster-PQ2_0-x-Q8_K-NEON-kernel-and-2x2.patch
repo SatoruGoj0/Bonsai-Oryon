@@ -1,0 +1,295 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 16 Oct 2026 09:47:24 +0000
+Subject: [PATCH] ggml-cpu: arm: faster PQ2_0 x Q8_K NEON kernel and 2x2 tile
+
+Replace the TBL/SHL/AND/SUB unpacking of PQ2_0 codes with a de-interleaved
+formulation: shift+mask a 16-byte load into four code vectors and pair them with
+VLD4-de-interleaved Q8_K activations. The -1 code offset is removed with the
+Q8_K bsums instead of a per-vector subtract, and four blocks are scaled per
+float32x4 lane. Adds an nrc == 2 (2 rows x 2 columns) tile so prompt processing
+decodes each weight vector once for two tokens; PQ2_0 advertises nrows = 2 on
+AArch64 NEON. Per (row, col) the float sequence is identical in both paths, so
+batched and single-token results are bit-identical. The Q8_0 fallback used for
+rows that are not a multiple of 256 serves nrc == 2 one dot at a time.
+
+Part of Bonsai-Oryon (https://github.com/SatoruGoj0/Bonsai-Oryon).
+---
+ ggml/src/ggml-cpu/arch/arm/quants.c | 224 ++++++++++++++++++++++------
+ ggml/src/ggml-cpu/ggml-cpu.c        |   4 +
+ 2 files changed, 183 insertions(+), 45 deletions(-)
+
+diff --git a/ggml/src/ggml-cpu/arch/arm/quants.c b/ggml/src/ggml-cpu/arch/arm/quants.c
+index 490a9a444..0df838ecc 100644
+--- a/ggml/src/ggml-cpu/arch/arm/quants.c
++++ b/ggml/src/ggml-cpu/arch/arm/quants.c
+@@ -299,7 +299,16 @@ void ggml_vec_dot_pq2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
+     const int nb = n / qk;
+ 
+     assert(n % qk == 0);
+-    assert(nrc == 1);
++    assert(nrc == 1 || nrc == 2);
++    if (nrc == 2) {
++        // PQ2_0 advertises nrows = 2 on NEON for the Q8_K kernel; rows that are not a multiple of QK_K
++        // fall back to Q8_0 activations and take this path, so serve the 2x2 tile one dot at a time.
++        ggml_vec_dot_pq2_0_q8_0(n, s,          0, vx,                     0, vy,                     0, 1);
++        ggml_vec_dot_pq2_0_q8_0(n, s + 1,      0, (const char *) vx + bx, 0, vy,                     0, 1);
++        ggml_vec_dot_pq2_0_q8_0(n, s + bs,     0, vx,                     0, (const char *) vy + by, 0, 1);
++        ggml_vec_dot_pq2_0_q8_0(n, s + bs + 1, 0, (const char *) vx + bx, 0, (const char *) vy + by, 0, 1);
++        return;
++    }
+     UNUSED(nrc);
+     UNUSED(bx);
+     UNUSED(by);
+@@ -365,66 +374,191 @@ void ggml_vec_dot_pq2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
+     *s = sumf;
+ }
+ 
+-void ggml_vec_dot_pq2_0_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+-    assert(n % QK_K == 0);
+-    assert(nrc == 1);
+-    UNUSED(nrc);
+-    UNUSED(bx);
+-    UNUSED(by);
+-    UNUSED(bs);
++#if defined(__ARM_NEON)
++// Bonsai-Oryon: PQ2_0 x Q8_K NEON kernel, de-interleaved formulation.
++//
++// Byte m of a PQ2_0 block holds the 2-bit codes of weights 4m..4m+3 (LSB pair first), weight = d * (code - 1).
++// Shifting a 16-byte load right by 0/2/4/6 (and masking) yields four vectors whose lane m holds the code of
++// weight 4m+j. VLD4 de-interleaves the matching activations the same way (val[j][m] = q8[4m+j]), so the
++// codes are paired with their activations without the TBL/SHL/AND/SUB sequence per 16 weights that the
++// previous kernel needed. The "-1" offset is folded out algebraically, using the per-16 sums Q8_K already
++// carries: sum((c-1)*y) = sum(c*y) - sum(y). Codes are 0..3 and therefore valid signed int8 SDOT operands.
++//
++// Integer block sums are exact; four blocks are scaled and accumulated per float32x4 lane, which is a
++// different (but equally valid) float summation order from the scalar reference. The nrc == 2 path below
++// uses the identical float sequence per (row, col), so batched and single-token results are bit-identical.
++
++static inline int32x4_t pq2_0_dot64(int32x4_t acc, const uint8x16_t q, const int8x16x4_t y) {
++    const uint8x16_t m3 = vdupq_n_u8(3);
++    acc = ggml_vdotq_s32(acc, vreinterpretq_s8_u8(vandq_u8(q, m3)),                y.val[0]);
++    acc = ggml_vdotq_s32(acc, vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q, 2), m3)), y.val[1]);
++    acc = ggml_vdotq_s32(acc, vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q, 4), m3)), y.val[2]);
++    acc = ggml_vdotq_s32(acc, vreinterpretq_s8_u8(vshrq_n_u8(q, 6)),               y.val[3]);
++    return acc;
++}
+ 
+-    const block_pq2_0 * GGML_RESTRICT x = vx;
+-    const block_q8_K  * GGML_RESTRICT y = vy;
+-    const int nb = n / QK_PQ2_0;
++// integer sum of codes*activations over one 128-weight PQ2_0 block (offset not yet removed)
++static inline int32x4_t pq2_0_block_acc(const block_pq2_0 * GGML_RESTRICT xb, const int8_t * GGML_RESTRICT q8) {
++    int32x4_t acc = pq2_0_dot64(vdupq_n_s32(0), vld1q_u8(xb->qs), vld4q_s8(q8));
++    return pq2_0_dot64(acc, vld1q_u8(xb->qs + 16), vld4q_s8(q8 + 64));
++}
+ 
+-    float sumf = 0.0f;
++// sum of activations for the four 128-halves of two consecutive Q8_K blocks, one per lane
++static inline int32x4_t pq2_0_ysum4(const block_q8_K * GGML_RESTRICT yb) {
++    const int32x4_t s0 = vpaddlq_s16(vld1q_s16(yb[0].bsums));
++    const int32x4_t s1 = vpaddlq_s16(vld1q_s16(yb[0].bsums + 8));
++    const int32x4_t s2 = vpaddlq_s16(vld1q_s16(yb[1].bsums));
++    const int32x4_t s3 = vpaddlq_s16(vld1q_s16(yb[1].bsums + 8));
++    return vpaddq_s32(vpaddq_s32(s0, s1), vpaddq_s32(s2, s3));
++}
+ 
+-#if defined(__ARM_NEON)
+-    // Same 2-bit codec as the Q8_0 path above: byte b of a 32-weight sub-block holds
+-    // weights 4b..4b+3, LSB pair first, so replicating each byte four times and shifting
+-    // by {0,2,4,6} lands code 4b+j at lane 4b+j. With one activation scale per 256 the
+-    // four sub-block dots accumulate in int32 and the scale is applied once per block,
+-    // instead of a float multiply-add per sub-block.
+-    static const uint8_t tbl_idx_lo[16] = {0,0,0,0, 1,1,1,1, 2,2,2,2, 3,3,3,3};
+-    static const uint8_t tbl_idx_hi[16] = {4,4,4,4, 5,5,5,5, 6,6,6,6, 7,7,7,7};
+-    static const int8_t  shift_vals[16] = {0,-2,-4,-6, 0,-2,-4,-6, 0,-2,-4,-6, 0,-2,-4,-6};
++static inline float32x4_t pq2_0_scale4(const block_pq2_0 * GGML_RESTRICT xb, const block_q8_K * GGML_RESTRICT yb) {
++    const float sc[4] = {
++        GGML_CPU_FP16_TO_FP32(xb[0].d) * yb[0].d,
++        GGML_CPU_FP16_TO_FP32(xb[1].d) * yb[0].d,
++        GGML_CPU_FP16_TO_FP32(xb[2].d) * yb[1].d,
++        GGML_CPU_FP16_TO_FP32(xb[3].d) * yb[1].d,
++    };
++    return vld1q_f32(sc);
++}
+ 
+-    const uint8x16_t idx_lo = vld1q_u8(tbl_idx_lo);
+-    const uint8x16_t idx_hi = vld1q_u8(tbl_idx_hi);
+-    const int8x16_t  shifts = vld1q_s8(shift_vals);
+-    const uint8x16_t mask2  = vdupq_n_u8(0x03);
+-    const int8x16_t  one    = vdupq_n_s8(1);
++static inline float pq2_0_tail2(const block_pq2_0 * GGML_RESTRICT xb, const block_q8_K * GGML_RESTRICT yb, int32_t isum0, int32_t isum1) {
++    const int32_t s0 = vaddlvq_s16(vld1q_s16(yb->bsums));
++    const int32_t s1 = vaddlvq_s16(vld1q_s16(yb->bsums + 8));
++    float t = (GGML_CPU_FP16_TO_FP32(xb[0].d) * yb->d) * (float) (isum0 - s0);
++    t      += (GGML_CPU_FP16_TO_FP32(xb[1].d) * yb->d) * (float) (isum1 - s1);
++    return t;
++}
+ 
+-    for (int i = 0; i < nb; i++) {
++static float pq2_0_q8_K_row(const int nb, const block_pq2_0 * GGML_RESTRICT x, const block_q8_K * GGML_RESTRICT y) {
++    float32x4_t sumv = vdupq_n_f32(0.0f);
++    int i = 0;
++    for (; i + 4 <= nb; i += 4) {
+         const block_q8_K * GGML_RESTRICT yb = &y[i >> 1];
+-        const int8_t     * GGML_RESTRICT q8 = yb->qs + 128 * (i & 1);
++        const int32x4_t a0 = pq2_0_block_acc(&x[i + 0], yb[0].qs);
++        const int32x4_t a1 = pq2_0_block_acc(&x[i + 1], yb[0].qs + 128);
++        const int32x4_t a2 = pq2_0_block_acc(&x[i + 2], yb[1].qs);
++        const int32x4_t a3 = pq2_0_block_acc(&x[i + 3], yb[1].qs + 128);
++        const int32x4_t isum = vsubq_s32(vpaddq_s32(vpaddq_s32(a0, a1), vpaddq_s32(a2, a3)), pq2_0_ysum4(yb));
++        sumv = vfmaq_f32(sumv, vcvtq_f32_s32(isum), pq2_0_scale4(&x[i], yb));
++    }
++    float sumf = vaddvq_f32(sumv);
++    if (i < nb) { // nb is even (n % QK_K == 0): exactly one Q8_K block left
++        const block_q8_K * GGML_RESTRICT yb = &y[i >> 1];
++        sumf += pq2_0_tail2(&x[i], yb, vaddvq_s32(pq2_0_block_acc(&x[i], yb->qs)), vaddvq_s32(pq2_0_block_acc(&x[i + 1], yb->qs + 128)));
++    }
++    return sumf;
++}
+ 
+-        int32x4_t acc = vdupq_n_s32(0);
++// 2 rows x 2 columns: every weight vector is decoded once and used for both columns, every activation
++// vector is loaded once and used for both rows. Float sequence per (row, col) matches pq2_0_q8_K_row.
++typedef struct { int32x4_t c00, c10, c01, c11; } pq2_0_acc2x2;
+ 
+-        for (int k = 0; k < 4; k++) {
+-            const uint8x8_t  raw   = vld1_u8(&x[i].qs[8 * k]);
+-            const uint8x16_t raw16 = vcombine_u8(raw, raw);
++static inline __attribute__((always_inline)) pq2_0_acc2x2 pq2_0_block_2x2(
++        const uint8_t * GGML_RESTRICT q0p, const uint8_t * GGML_RESTRICT q1p,
++        const int8_t  * GGML_RESTRICT ya,  const int8_t  * GGML_RESTRICT yc) {
++    const uint8x16_t m3 = vdupq_n_u8(3);
++    pq2_0_acc2x2 r = { vdupq_n_s32(0), vdupq_n_s32(0), vdupq_n_s32(0), vdupq_n_s32(0) };
++    for (int h = 0; h < 2; ++h) {
++        const int8x16x4_t y0 = vld4q_s8(ya + 64 * h);
++        const int8x16x4_t y1 = vld4q_s8(yc + 64 * h);
++        const uint8x16_t  q0 = vld1q_u8(q0p + 16 * h);
++        const uint8x16_t  q1 = vld1q_u8(q1p + 16 * h);
++        int8x16_t w;
++        w = vreinterpretq_s8_u8(vandq_u8(q0, m3));
++        r.c00 = ggml_vdotq_s32(r.c00, w, y0.val[0]); r.c01 = ggml_vdotq_s32(r.c01, w, y1.val[0]);
++        w = vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q0, 2), m3));
++        r.c00 = ggml_vdotq_s32(r.c00, w, y0.val[1]); r.c01 = ggml_vdotq_s32(r.c01, w, y1.val[1]);
++        w = vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q0, 4), m3));
++        r.c00 = ggml_vdotq_s32(r.c00, w, y0.val[2]); r.c01 = ggml_vdotq_s32(r.c01, w, y1.val[2]);
++        w = vreinterpretq_s8_u8(vshrq_n_u8(q0, 6));
++        r.c00 = ggml_vdotq_s32(r.c00, w, y0.val[3]); r.c01 = ggml_vdotq_s32(r.c01, w, y1.val[3]);
++        w = vreinterpretq_s8_u8(vandq_u8(q1, m3));
++        r.c10 = ggml_vdotq_s32(r.c10, w, y0.val[0]); r.c11 = ggml_vdotq_s32(r.c11, w, y1.val[0]);
++        w = vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q1, 2), m3));
++        r.c10 = ggml_vdotq_s32(r.c10, w, y0.val[1]); r.c11 = ggml_vdotq_s32(r.c11, w, y1.val[1]);
++        w = vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q1, 4), m3));
++        r.c10 = ggml_vdotq_s32(r.c10, w, y0.val[2]); r.c11 = ggml_vdotq_s32(r.c11, w, y1.val[2]);
++        w = vreinterpretq_s8_u8(vshrq_n_u8(q1, 6));
++        r.c10 = ggml_vdotq_s32(r.c10, w, y0.val[3]); r.c11 = ggml_vdotq_s32(r.c11, w, y1.val[3]);
++    }
++    return r;
++}
+ 
+-            const int8x16_t qv0 = vsubq_s8(
+-                vreinterpretq_s8_u8(vandq_u8(vshlq_u8(ggml_vqtbl1q_u8(raw16, idx_lo), shifts), mask2)), one);
+-            const int8x16_t qv1 = vsubq_s8(
+-                vreinterpretq_s8_u8(vandq_u8(vshlq_u8(ggml_vqtbl1q_u8(raw16, idx_hi), shifts), mask2)), one);
++// pairwise-reduce two blocks' accumulators: lanes {blkA, blkA, blkB, blkB} partial sums
++static inline pq2_0_acc2x2 pq2_0_pair_2x2(const pq2_0_acc2x2 a, const pq2_0_acc2x2 b) {
++    pq2_0_acc2x2 r = { vpaddq_s32(a.c00, b.c00), vpaddq_s32(a.c10, b.c10), vpaddq_s32(a.c01, b.c01), vpaddq_s32(a.c11, b.c11) };
++    return r;
++}
+ 
+-            const int8x16_t y0 = vld1q_s8(q8 + 32 * k);
+-            const int8x16_t y1 = vld1q_s8(q8 + 32 * k + 16);
++static void pq2_0_q8_K_2x2(const int nb, float * GGML_RESTRICT s, size_t bs,
++                           const block_pq2_0 * GGML_RESTRICT x0, const block_pq2_0 * GGML_RESTRICT x1,
++                           const block_q8_K  * GGML_RESTRICT y0, const block_q8_K  * GGML_RESTRICT y1) {
++    float32x4_t s00 = vdupq_n_f32(0.0f), s10 = vdupq_n_f32(0.0f), s01 = vdupq_n_f32(0.0f), s11 = vdupq_n_f32(0.0f);
++
++    int i = 0;
++    for (; i + 4 <= nb; i += 4) {
++        const block_q8_K * GGML_RESTRICT yb0 = &y0[i >> 1];
++        const block_q8_K * GGML_RESTRICT yb1 = &y1[i >> 1];
++        const pq2_0_acc2x2 p01 = pq2_0_pair_2x2(
++            pq2_0_block_2x2(x0[i + 0].qs, x1[i + 0].qs, yb0[0].qs,       yb1[0].qs),
++            pq2_0_block_2x2(x0[i + 1].qs, x1[i + 1].qs, yb0[0].qs + 128, yb1[0].qs + 128));
++        const pq2_0_acc2x2 p23 = pq2_0_pair_2x2(
++            pq2_0_block_2x2(x0[i + 2].qs, x1[i + 2].qs, yb0[1].qs,       yb1[1].qs),
++            pq2_0_block_2x2(x0[i + 3].qs, x1[i + 3].qs, yb0[1].qs + 128, yb1[1].qs + 128));
++        const int32x4_t ys0 = pq2_0_ysum4(yb0);
++        const int32x4_t ys1 = pq2_0_ysum4(yb1);
++        s00 = vfmaq_f32(s00, vcvtq_f32_s32(vsubq_s32(vpaddq_s32(p01.c00, p23.c00), ys0)), pq2_0_scale4(&x0[i], yb0));
++        s10 = vfmaq_f32(s10, vcvtq_f32_s32(vsubq_s32(vpaddq_s32(p01.c10, p23.c10), ys0)), pq2_0_scale4(&x1[i], yb0));
++        s01 = vfmaq_f32(s01, vcvtq_f32_s32(vsubq_s32(vpaddq_s32(p01.c01, p23.c01), ys1)), pq2_0_scale4(&x0[i], yb1));
++        s11 = vfmaq_f32(s11, vcvtq_f32_s32(vsubq_s32(vpaddq_s32(p01.c11, p23.c11), ys1)), pq2_0_scale4(&x1[i], yb1));
++    }
++    float r00 = vaddvq_f32(s00), r10 = vaddvq_f32(s10), r01 = vaddvq_f32(s01), r11 = vaddvq_f32(s11);
++    if (i < nb) {
++        const block_q8_K * GGML_RESTRICT yb0 = &y0[i >> 1];
++        const block_q8_K * GGML_RESTRICT yb1 = &y1[i >> 1];
++        const pq2_0_acc2x2 a = pq2_0_block_2x2(x0[i + 0].qs, x1[i + 0].qs, yb0->qs,       yb1->qs);
++        const pq2_0_acc2x2 b = pq2_0_block_2x2(x0[i + 1].qs, x1[i + 1].qs, yb0->qs + 128, yb1->qs + 128);
++        r00 += pq2_0_tail2(&x0[i], yb0, vaddvq_s32(a.c00), vaddvq_s32(b.c00));
++        r10 += pq2_0_tail2(&x1[i], yb0, vaddvq_s32(a.c10), vaddvq_s32(b.c10));
++        r01 += pq2_0_tail2(&x0[i], yb1, vaddvq_s32(a.c01), vaddvq_s32(b.c01));
++        r11 += pq2_0_tail2(&x1[i], yb1, vaddvq_s32(a.c11), vaddvq_s32(b.c11));
++    }
++    s[0]      = r00;
++    s[1]      = r10;
++    s[bs]     = r01;
++    s[bs + 1] = r11;
++}
++#endif // __ARM_NEON
+ 
+-            acc = ggml_vdotq_s32(acc, qv0, y0);
+-            acc = ggml_vdotq_s32(acc, qv1, y1);
+-        }
++void ggml_vec_dot_pq2_0_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
++    assert(n % QK_K == 0);
++    assert(nrc == 1 || nrc == 2);
+ 
+-        sumf += (GGML_CPU_FP16_TO_FP32(x[i].d) * yb->d) * (float) vaddvq_s32(acc);
++    const block_pq2_0 * GGML_RESTRICT x = vx;
++    const block_q8_K  * GGML_RESTRICT y = vy;
++    const int nb = n / QK_PQ2_0;
++
++#if defined(__ARM_NEON)
++    if (nrc == 2) {
++        pq2_0_q8_K_2x2(nb, s, bs, x, (const block_pq2_0 *) ((const char *) vx + bx),
++                       y, (const block_q8_K *) ((const char *) vy + by));
++        return;
+     }
++    *s = pq2_0_q8_K_row(nb, x, y);
+ #else
++    UNUSED(x);
++    UNUSED(y);
++    UNUSED(nb);
++    if (nrc == 2) {
++        ggml_vec_dot_pq2_0_q8_K_generic(n, s,          0, vx,      0, vy,      0, 1);
++        ggml_vec_dot_pq2_0_q8_K_generic(n, s + 1,      0, (const char *) vx + bx, 0, vy,      0, 1);
++        ggml_vec_dot_pq2_0_q8_K_generic(n, s + bs,     0, vx,      0, (const char *) vy + by, 0, 1);
++        ggml_vec_dot_pq2_0_q8_K_generic(n, s + bs + 1, 0, (const char *) vx + bx, 0, (const char *) vy + by, 0, 1);
++        return;
++    }
+     ggml_vec_dot_pq2_0_q8_K_generic(n, s, bs, vx, bx, vy, by, nrc);
+-    return;
+ #endif
+-
+-    *s = sumf;
+ }
+ 
+ void ggml_vec_dot_q4_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 666c15760..202455401 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -241,7 +241,11 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
+         .from_float               = quantize_row_pq2_0,
+         .vec_dot                  = ggml_vec_dot_pq2_0_q8_K,
+         .vec_dot_type             = GGML_TYPE_Q8_K,
++#if defined(__aarch64__) && defined(__ARM_NEON) && !defined(GGML_CPU_GENERIC)
++        .nrows                    = 2, // Bonsai-Oryon: 2x2 NEON tile in arch/arm/quants.c
++#else
+         .nrows                    = 1,
++#endif
+     },
+     [GGML_TYPE_PTQ1_0] = {
+         .from_float               = quantize_row_ptq1_0,

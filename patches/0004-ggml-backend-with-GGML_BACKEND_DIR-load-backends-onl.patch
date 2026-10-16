@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 16 Oct 2026 09:47:25 +0000
+Subject: [PATCH] ggml-backend: with GGML_BACKEND_DIR, load backends only from
+ that directory
+
+A packaged build must never pick up a stray libggml-*.so (e.g. another build's
+Vulkan backend) from the executable directory or the current directory.
+
+Part of Bonsai-Oryon (https://github.com/SatoruGoj0/Bonsai-Oryon).
+---
+ ggml/src/ggml-backend-reg.cpp | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-backend-reg.cpp b/ggml/src/ggml-backend-reg.cpp
+index e59594670..a1baa2526 100644
+--- a/ggml/src/ggml-backend-reg.cpp
++++ b/ggml/src/ggml-backend-reg.cpp
+@@ -486,11 +486,17 @@ static ggml_backend_reg_t ggml_backend_load_best(const char * name, bool silent,
+     std::vector<fs::path> search_paths;
+     if (user_search_path == nullptr) {
+ #ifdef GGML_BACKEND_DIR
+-        search_paths.push_back(fs::u8path(GGML_BACKEND_DIR));
+-#endif
++        // Bonsai-Oryon: a packaged build loads backends from its private directory ONLY, so a stray
++        // libggml-*.so (e.g. a Vulkan backend of another llama.cpp build) in the executable directory or
++        // the current working directory can never be mixed into this process. BONSAI_BACKEND_DIR lets
++        // the test suite point build-tree binaries at their own backends.
++        const char * bonsai_dir = std::getenv("BONSAI_BACKEND_DIR");
++        search_paths.push_back(fs::u8path(bonsai_dir && bonsai_dir[0] ? bonsai_dir : GGML_BACKEND_DIR));
++#else
+         // default search paths: executable directory, current directory
+         search_paths.push_back(get_executable_path());
+         search_paths.push_back(fs::current_path());
++#endif
+     } else {
+         search_paths.push_back(fs::u8path(user_search_path));
+     }

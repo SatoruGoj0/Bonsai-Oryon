@@ -1,0 +1,28 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 16 Oct 2026 09:47:25 +0000
+Subject: [PATCH] ggml: add armv8.6_nosve CPU variant (DOTPROD+FP16+I8MM, no
+ SVE)
+
+Every Linux I8MM variant also requires SVE, so cores with I8MM but no SVE, such
+as Qualcomm Oryon (Snapdragon X), were scored onto armv8.2_2 and lost I8MM.
+
+Part of Bonsai-Oryon (https://github.com/SatoruGoj0/Bonsai-Oryon).
+---
+ ggml/src/CMakeLists.txt | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/ggml/src/CMakeLists.txt b/ggml/src/CMakeLists.txt
+index 9fef45dfd..e17f3b5fc 100644
+--- a/ggml/src/CMakeLists.txt
++++ b/ggml/src/CMakeLists.txt
+@@ -525,6 +525,9 @@ if (GGML_CPU_ALL_VARIANTS)
+             ggml_add_cpu_backend_variant(armv8.2_2    DOTPROD FP16_VECTOR_ARITHMETIC)
+             ggml_add_cpu_backend_variant(armv8.2_3    DOTPROD FP16_VECTOR_ARITHMETIC SVE)
+             ggml_add_cpu_backend_variant(armv8.6_1    DOTPROD FP16_VECTOR_ARITHMETIC SVE MATMUL_INT8)
++            # Bonsai-Oryon: Qualcomm Oryon (Snapdragon X) and other cores with I8MM but without SVE
++            # would otherwise fall back to armv8.2_2, since every I8MM variant above also requires SVE.
++            ggml_add_cpu_backend_variant(armv8.6_nosve DOTPROD FP16_VECTOR_ARITHMETIC MATMUL_INT8 NOSVE)
+             ggml_add_cpu_backend_variant(armv8.6_2    DOTPROD FP16_VECTOR_ARITHMETIC SVE MATMUL_INT8 SVE2)
+             ggml_add_cpu_backend_variant(armv9.2_1    DOTPROD FP16_VECTOR_ARITHMETIC SVE MATMUL_INT8 SME)
+             ggml_add_cpu_backend_variant(armv9.2_2    DOTPROD FP16_VECTOR_ARITHMETIC SVE MATMUL_INT8 SVE2 SME)
