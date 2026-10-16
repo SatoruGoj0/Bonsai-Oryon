@@ -28,7 +28,7 @@ jobs:
     env:
       DEBIAN_FRONTEND: noninteractive
     steps:
-      - run: apt-get update -qq && apt-get install -y -qq --no-install-recommends git ca-certificates python3 python3-numpy python3-yaml curl libgomp1
+      - run: apt-get update -qq && apt-get install -y -qq --no-install-recommends git ca-certificates python3 python3-numpy python3-yaml curl libgomp1 time iproute2
       - uses: actions/checkout@v4
         with: { submodules: true }
       - uses: actions/download-artifact@v4
@@ -96,10 +96,76 @@ jobs:
           for t in sorted(rows): print(f"| {sys.argv[2]} | {t} | {rows[t].get('pp')} | {rows[t].get('tg')} |")
           PY
           }
-          ab "upstream kernels (e3de715 + 0003/0004)" base
-          ab "v0.1 path (BONSAI_PQ2_REPACK=0)" opt BONSAI_PQ2_REPACK=0
-          ab "v0.2 4-row layout (default)" opt
-          ab "v0.2 ternary 4-row (BONSAI_PQ2_TERNARY=1)" opt BONSAI_PQ2_TERNARY=1
+          abd() { # label libdir-for-backends env... (binaries from opt/bin)
+            lab=$1; d=$2; shift 2; l=$(echo "$lab" | tr -c 'A-Za-z0-9\n' '_')
+            env "$@" LD_LIBRARY_PATH=$PWD/opt/bin BONSAI_BACKEND_DIR=$PWD/$d opt/bin/llama-bench -m /models/bonsai.gguf \
+              -t 1,2,4 -ngl 0 -p 256 -n 128 -r 3 -o json > /tmp/$l.json 2>/tmp/$l.log || { tail /tmp/$l.log; return 1; }
+            python3 - /tmp/$l.json "$lab" >> $R <<'PY'
+          import json, sys
+          rows = {}
+          for r in json.load(open(sys.argv[1])):
+              rows.setdefault(r["n_threads"], {})["pp" if r["n_prompt"] else "tg"] = "%.2f ± %.2f" % (r["avg_ts"], r["stddev_ts"])
+          for t in sorted(rows): print(f"| {sys.argv[2]} | {t} | {rows[t].get('pp')} | {rows[t].get('tg')} |")
+          PY
+          }
+          ab "upstream (e3de715 kernels + OpenMP threading)" base
+          abd "v0.1 kernels, OpenMP (v0.1 equivalent)" opt/bin/omp BONSAI_PQ2_REPACK=0
+          abd "v0.2 4-row, OpenMP (v0.2 equivalent)" opt/bin/omp
+          abd "v0.3 4-row, threadpool (default)" opt/bin
+          abd "v0.3 threadpool + BONSAI_TG_NOBARRIER=1" opt/bin BONSAI_TG_NOBARRIER=1
+          abd "v0.3 threadpool, pure spin (BONSAI_BARRIER_SPIN=-1)" opt/bin BONSAI_BARRIER_SPIN=-1
+          abd "v0.3 threadpool, yield (BONSAI_BARRIER_SPIN=0)" opt/bin BONSAI_BARRIER_SPIN=0
+          abd "v0.3 threadpool, ternary 4-row" opt/bin BONSAI_PQ2_TERNARY=1
+          cat $R
+      - name: where decode time goes (BONSAI_PROFILE=1, tg64, 4 threads)
+        run: |
+          R=results/real-profile.md; echo "### graph profiler, tg64 on the runner CPU (NOT Snapdragon X)" > $R
+          for v in "threadpool|opt/bin|-" "threadpool+nobarrier|opt/bin|BONSAI_TG_NOBARRIER=1" "OpenMP|opt/bin/omp|-"; do
+            IFS='|' read -r n d e <<< "$v"; envs=(); [ "$e" != - ] && envs=($e)
+            { echo; echo "#### $n"; echo '```'; } >> $R
+            env "${envs[@]}" BONSAI_PROFILE=1 LD_LIBRARY_PATH=$PWD/opt/bin BONSAI_BACKEND_DIR=$PWD/$d opt/bin/llama-bench -m /models/bonsai.gguf \
+              -t 4 -ngl 0 -p 0 -n 64 -r 1 2>&1 | grep -E 'bonsai-profile|tg64' >> $R
+            echo '```' >> $R
+          done
+          cat $R
+      - name: model load time and peak RSS (mmap vs no-mmap, 4-row vs plain layout)
+        run: |
+          R=results/real-load.md
+          { echo "### load time and peak RSS, one 1-token run (runner, page cache warm after the first run)"; echo
+            echo "| layout | load | wall s | peak RSS MiB |"; echo "|---|---|---|---|"; } > $R
+          export LD_LIBRARY_PATH=$PWD/opt/bin BONSAI_BACKEND_DIR=$PWD/opt/bin
+          opt/bin/llama-bench -m /models/bonsai.gguf -t 4 -ngl 0 -p 0 -n 1 -r 1 --no-warmup > /dev/null 2>&1
+          for v in "4-row|1|1" "4-row|0|1" "plain (BONSAI_PQ2_REPACK=0)|1|0" "plain (BONSAI_PQ2_REPACK=0)|0|0"; do
+            IFS='|' read -r lay mm rp <<< "$v"
+            BONSAI_PQ2_REPACK=$rp /usr/bin/time -f '%e %M' -o /tmp/t opt/bin/llama-bench -m /models/bonsai.gguf -t 4 -ngl 0 -p 0 -n 1 -r 1 --no-warmup -mmp $mm > /dev/null 2>&1
+            read -r w m < /tmp/t; echo "| $lay | $([ $mm = 1 ] && echo mmap || echo no-mmap) | $w | $((m / 1024)) |" >> $R
+          done
+          cat $R
+      - name: "real-model server - chat, streaming and tool calling (OpenAI API)"
+        continue-on-error: true
+        run: |
+          R=results/real-server.md; echo "### real-model OpenAI-compatible server checks" > $R; echo >> $R
+          export LD_LIBRARY_PATH=$PWD/opt/bin BONSAI_BACKEND_DIR=$PWD/opt/bin
+          opt/bin/llama-server -m /models/bonsai.gguf --alias bonsai -ngl 0 -c 4096 --jinja --port 18090 > /tmp/srv.log 2>&1 &
+          SRV=$!
+          for i in $(seq 1 600); do curl -sf http://127.0.0.1:18090/health >/dev/null && break; sleep 1; done
+          grep -m1 'bonsai-oryon profile' /tmp/srv.log | sed 's/^/- /' >> $R
+          curl -s http://127.0.0.1:18090/v1/chat/completions -H 'Content-Type: application/json' -d '{"model":"bonsai","temperature":0,"max_tokens":64,"messages":[{"role":"user","content":"What is the capital of France? Answer in one word."}]}' > /tmp/chat.json
+          curl -sN http://127.0.0.1:18090/v1/chat/completions -H 'Content-Type: application/json' -d '{"model":"bonsai","temperature":0,"max_tokens":32,"stream":true,"messages":[{"role":"user","content":"Count from 1 to 5."}]}' > /tmp/stream.txt
+          curl -s http://127.0.0.1:18090/v1/chat/completions -H 'Content-Type: application/json' -d '{"model":"bonsai","temperature":0,"max_tokens":256,"messages":[{"role":"user","content":"What is the weather in Paris right now? Use the tool."}],"tools":[{"type":"function","function":{"name":"get_weather","description":"Get the current weather for a city","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}]}' > /tmp/tools.json
+          python3 - >> $R <<'PY'
+          import json
+          c = json.load(open("/tmp/chat.json"))["choices"][0]["message"]
+          print(f"- chat: {c.get('content','')[:200]!r} (contains 'Paris': {'paris' in (c.get('content') or '').lower()})")
+          chunks = [l for l in open("/tmp/stream.txt") if l.startswith("data: {")]
+          done = any(l.startswith("data: [DONE]") for l in open("/tmp/stream.txt"))
+          text = "".join((json.loads(l[6:])["choices"][0]["delta"].get("content") or "") for l in chunks if json.loads(l[6:])["choices"])
+          print(f"- streaming: {len(chunks)} SSE chunks, [DONE]: {done}, text {text[:120]!r}")
+          m = json.load(open("/tmp/tools.json"))["choices"][0]
+          tc = m["message"].get("tool_calls") or []
+          print(f"- tool calling: finish_reason={m.get('finish_reason')}, tool_calls={[(t['function']['name'], t['function']['arguments']) for t in tc]}")
+          PY
+          kill $SRV || true
           cat $R
       - if: always()
         run: cat results/*.md >> "$GITHUB_STEP_SUMMARY"
@@ -116,17 +182,18 @@ jobs:
         with: { name: engine-bin, run-id: '${{ inputs.ci_run_id }}', github-token: '${{ github.token }}' }
       - run: mkdir -p opt && tar -C opt -xzf engine-bin.tgz
       - run: curl -fL --retry 5 -o model.gguf "$MODEL_URL"
-      - name: perf record tg (v0.2 default and v0.1 path)
+      - name: perf record tg (v0.3 threadpool, barrier-free decode, v0.2 OpenMP)
         run: |
           sudo sysctl -w kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0
           cat > prof.sh <<'EOF'
           set -e
           apt-get update -qq && apt-get install -y -qq --no-install-recommends linux-perf libgomp1 >/dev/null
-          export LD_LIBRARY_PATH=/w/opt/bin BONSAI_BACKEND_DIR=/w/opt/bin
-          for v in v02:1:0 v01:0:0 v02ternary:1:1; do
-            n=${v%%:*}; rt=${v#*:}; BONSAI_PQ2_TERNARY=${rt#*:} BONSAI_PQ2_REPACK=${rt%%:*} perf record -q -F 1999 -o /w/$n.data -- \
+          export LD_LIBRARY_PATH=/w/opt/bin
+          for v in v03-threadpool:/w/opt/bin:0 v03-nobarrier:/w/opt/bin:1 v02-openmp:/w/opt/bin/omp:0; do
+            IFS=: read -r n d nb <<< "$v"
+            BONSAI_BACKEND_DIR=$d BONSAI_TG_NOBARRIER=$nb perf record -q -F 1999 -o /w/$n.data -- \
               /w/opt/bin/llama-bench -m /w/model.gguf -t 4 -ngl 0 -p 0 -n 64 -r 1 >/w/$n.bench 2>&1
-            echo "### $n (BONSAI_PQ2_REPACK=${rt%%:*} BONSAI_PQ2_TERNARY=${rt#*:}): top symbols and DSOs, tg64, 4 threads"
+            echo "### $n (backend dir $d, BONSAI_TG_NOBARRIER=$nb): top symbols and DSOs, tg64, 4 threads"
             grep -E '^\|' /w/$n.bench | tail -1
             echo '```'
             perf report -q -i /w/$n.data --no-children --sort dso --stdio 2>/dev/null | grep -v '^$' | cut -c1-120 | head -8

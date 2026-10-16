@@ -7,6 +7,9 @@
 #   /usr/lib/bonsai-oryon/bin/bonsai-diag        memory-bandwidth / GEMV diagnostics (not on $PATH)
 #   /usr/share/bonsai-oryon/                  benchmark / comparison scripts
 #   /usr/lib/bonsai-oryon/                    private libllama/libggml*/libmtmd + CPU variant modules
+#   /usr/lib/bonsai-oryon/omp/                CPU variant modules built with OpenMP (v0.2 threading), selected
+#                                             with BONSAI_BACKEND_DIR=/usr/lib/bonsai-oryon/omp
+#   /usr/bin/bonsai-tune                      writes the per-user tuned profile (~/.config/bonsai-oryon/profile)
 #   /usr/share/doc/bonsai-oryon/              README, changelog, copyright, upstream licenses, provenance
 # Nothing outside these paths is touched, no maintainer scripts, no services.
 set -euo pipefail
@@ -32,6 +35,9 @@ SHARE="${STAGE}/usr/share/${PKG}"
 install -D -m 0755 "${REPO_ROOT}/bench/bonsai-benchmark.sh"        "${SHARE}/bonsai-benchmark.sh"
 install -D -m 0755 "${REPO_ROOT}/bench/compare-output.sh"          "${SHARE}/compare-output.sh"
 install -D -m 0755 "${REPO_ROOT}/tests/numerics/compare-kld.sh"    "${SHARE}/compare-kld.sh"
+install -D -m 0755 "${REPO_ROOT}/bench/bonsai-bench-report.py"     "${SHARE}/bonsai-bench-report.py"
+install -D -m 0755 "${REPO_ROOT}/bench/bonsai-release-run.sh"      "${SHARE}/bonsai-release-run.sh"
+install -D -m 0755 "${REPO_ROOT}/bench/bonsai-tune.sh"             "${STAGE}/usr/bin/bonsai-tune"
 
 # private shared libraries: copy the real files and recreate the SONAME symlinks
 shopt -s nullglob
@@ -49,6 +55,12 @@ for f in "${STAGE}${BONSAI_LIBDIR}"/libllama-*-impl.so; do
 done
 n_variants=$(ls "${STAGE}${BONSAI_LIBDIR}"/libggml-cpu-*.so | wc -l)
 [ "${n_variants}" -ge 2 ] || die "CPU backend variants missing (${n_variants})"
+# OpenMP-threaded variant modules (same kernels, v0.2 threading) for A/B comparisons and fallback
+if [ "${REQUIRE_OMP_VARIANT:-1}" = 1 ] || ls "${BUILD}"/bin/omp/libggml-cpu-*.so >/dev/null 2>&1; then
+    n_omp=0
+    for f in "${BUILD}"/bin/omp/libggml-cpu-*.so; do install -D -m 0644 "$f" "${STAGE}${BONSAI_LIBDIR}/omp/$(basename "$f")"; n_omp=$((n_omp + 1)); done
+    [ "${n_omp}" -eq "${n_variants}" ] || die "OpenMP variant modules: ${n_omp}, expected ${n_variants}"
+fi
 
 # strip, keep build-id
 find "${STAGE}/usr" -type f \( -name '*.so*' -o -perm -u+x \) -exec sh -c 'file -b "$1" | grep -q ELF && strip --strip-unneeded --remove-section=.comment --remove-section=.note "$1"' _ {} \;
@@ -64,7 +76,9 @@ if grep -rl --binary-files=binary "${BUILD}" "${STAGE}/usr" >/dev/null 2>&1; the
     die "build-tree path leaked into: $(grep -rl "${BUILD}" "${STAGE}/usr" | head -3)"
 fi
 # every NEEDED library must be either private (shipped here) or a system library
-for f in "${STAGE}"/usr/bin/bonsai-* "${STAGE}${BONSAI_LIBDIR}"/bin/* "${STAGE}${BONSAI_LIBDIR}"/*.so*; do
+for f in "${STAGE}"/usr/bin/bonsai-* "${STAGE}${BONSAI_LIBDIR}"/bin/* "${STAGE}${BONSAI_LIBDIR}"/*.so* "${STAGE}${BONSAI_LIBDIR}"/omp/*.so; do
+    [ -e "$f" ] || continue
+    file -b "$f" | grep -q ELF || continue
     for n in $(readelf -d "$f" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p'); do
         case "$n" in libllama*|libggml*|libmtmd*) [ -e "${STAGE}${BONSAI_LIBDIR}/$n" ] || die "$(basename "$f") needs $n, not packaged";; esac
     done
@@ -91,7 +105,7 @@ mkdir -p "${BUILD_ROOT}/shlibs/debian"
 printf 'Source: %s\n\nPackage: %s\nArchitecture: %s\n' "${PKG}" "${PKG}" "${ARCH}" > "${BUILD_ROOT}/shlibs/debian/control"
 DEPS=$(cd "${BUILD_ROOT}/shlibs" && dpkg-shlibdeps -O -l"${STAGE}${BONSAI_LIBDIR}" \
           --ignore-missing-info \
-          "${STAGE}"/usr/bin/bonsai-* "${STAGE}${BONSAI_LIBDIR}"/bin/* "${STAGE}${BONSAI_LIBDIR}"/*.so* 2>/dev/null | sed -n 's/^shlibs:Depends=//p')
+          $(for f in "${STAGE}"/usr/bin/bonsai-* "${STAGE}${BONSAI_LIBDIR}"/bin/* "${STAGE}${BONSAI_LIBDIR}"/*.so* "${STAGE}${BONSAI_LIBDIR}"/omp/*.so; do [ -e "$f" ] && file -b "$f" | grep -q ELF && echo "$f"; done) 2>/dev/null | sed -n 's/^shlibs:Depends=//p')
 [ -n "${DEPS}" ] || die "dpkg-shlibdeps produced no dependencies"
 log "Depends: ${DEPS}"
 

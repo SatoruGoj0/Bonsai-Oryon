@@ -39,6 +39,31 @@ esac
 $EMU "$CLI" --version > "$WORK/ver.txt" 2>&1
 grep -q "bonsai-oryon" "$WORK/ver.txt" && ok "version-string" "$(grep -m1 -i version "$WORK/ver.txt")" || bad "version-string" "$(head -3 "$WORK/ver.txt")"
 
+# 2b. runtime profiles (--oryon-profile): built-in profiles, tuned profile file, rejection of unknown names
+NCPU=$(python3 -c 'import os; print(len(os.sched_getaffinity(0)))')
+prof_ok=1; prof_detail=""
+for p in balanced throughput low-power auto; do
+    l=$(timeout 600 $EMU "$BENCH" -m "$MODEL" --oryon-profile $p -ngl 0 -p 8 -n 2 -r 1 2>&1 >/dev/null | grep -m1 'bonsai-oryon profile')
+    [ -n "$l" ] || prof_ok=0
+    prof_detail="$prof_detail $p:$(echo "$l" | grep -oE 'threads [0-9]+' | head -1 | cut -d' ' -f2)"
+done
+mkdir -p "$WORK/cfg/bonsai-oryon"; printf 'ncpu=%s\nthreads=1\nthreads_batch=1\npoll=0\n' "$NCPU" > "$WORK/cfg/bonsai-oryon/profile"
+l=$(XDG_CONFIG_HOME="$WORK/cfg" timeout 600 $EMU "$BENCH" -m "$MODEL" --oryon-profile auto -ngl 0 -p 8 -n 2 -r 1 2>&1 >/dev/null | grep -m1 'bonsai-oryon profile')
+echo "$l" | grep -q 'auto(tuned).*threads 1 ' || { prof_ok=0; prof_detail="$prof_detail tuned:'$l'"; }
+printf 'ncpu=%s\nthreads=1\n' "$((NCPU + 1))" > "$WORK/cfg/bonsai-oryon/profile"     # measured on another CPU count: ignored
+l=$(XDG_CONFIG_HOME="$WORK/cfg" timeout 600 $EMU "$BENCH" -m "$MODEL" --oryon-profile auto -ngl 0 -p 8 -n 2 -r 1 2>&1 >/dev/null | grep -m1 'bonsai-oryon profile')
+echo "$l" | grep -q 'auto(balanced)' || { prof_ok=0; prof_detail="$prof_detail stale-tuned:'$l'"; }
+if timeout 120 $EMU "$CLI" -m "$MODEL" --oryon-profile no-such-profile -n 1 -st -p hi < /dev/null > /dev/null 2>&1; then prof_ok=0; prof_detail="$prof_detail unknown-name-accepted"; fi
+timeout 600 $EMU "$CLI" -m "$MODEL" --oryon-profile low-power -ngl 0 -c 256 -n 4 --temp 0 -st -p "hello" < /dev/null > /dev/null 2>&1 || { prof_ok=0; prof_detail="$prof_detail cli-low-power-failed"; }
+[ $prof_ok = 1 ] && ok "oryon-profiles" "threads per profile on $NCPU CPUs:$prof_detail; tuned file used, stale file ignored, unknown name rejected" \
+    || bad "oryon-profiles" "$prof_detail"
+
+# 2c. BONSAI_PROFILE=1 graph profiler report
+BONSAI_PROFILE=1 timeout 600 $EMU "$BENCH" -m "$MODEL" -t "$T" -ngl 0 -p 0 -n 8 -r 1 > /dev/null 2> "$WORK/prof.err"
+if grep -q 'bonsai-profile.*graphs' "$WORK/prof.err" && grep -q 'MUL_MAT(PQ2_0)' "$WORK/prof.err"; then
+    ok "graph-profiler" "$(grep -m1 'per thread' "$WORK/prof.err" | sed 's/\[bonsai-profile\] //')"
+else bad "graph-profiler" "$(tail -3 "$WORK/prof.err" | tr '\n' ' ')"; fi
+
 # 3. no foreign backend may be picked up from the current directory
 mkdir -p "$WORK/trap" && printf 'not an elf' > "$WORK/trap/libggml-vulkan-x.so" && printf 'junk' > "$WORK/trap/libggml-cpu-zzz.so"
 (cd "$WORK/trap" && timeout 600 $EMU "$BENCH" -m "$MODEL" -t "$T" -ngl 0 -p 8 -n 2 -r 1 > /dev/null 2> "$WORK/trap.err")
@@ -107,6 +132,9 @@ curl -s "http://127.0.0.1:$PORT/v1/chat/completions" -H 'Content-Type: applicati
 python3 -c "import json,sys; d=json.load(open(sys.argv[1])); assert 'choices' in d or 'error' in d" "$WORK/tools.json" \
     && ok "api-tools-request-shape" "$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print('choices' if 'choices' in d else 'error: '+d['error'].get('message','')[:120])" "$WORK/tools.json")" \
     || bad "api-tools-request-shape" "$(head -c 300 "$WORK/tools.json")"
+
+grep -q 'bonsai-oryon profile auto' "$WORK/srv.log" && ok "server-oryon-profile" "$(grep -m1 -o 'bonsai-oryon profile.*' "$WORK/srv.log")" \
+    || bad "server-oryon-profile" "no profile line in the server log"
 
 kill "$SPID" 2>/dev/null; wait "$SPID" 2>/dev/null; SPID=""
 

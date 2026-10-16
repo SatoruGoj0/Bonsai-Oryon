@@ -1,0 +1,118 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 16 Oct 2026 17:59:53 +0000
+Subject: [PATCH 9/9] ggml-cpu: repack: opt-in barrier-free single-token matmul
+
+With BONSAI_TG_NOBARRIER=1, a repacked matrix multiplication with fewer
+than 4 activation rows (token generation) lets every thread quantize the
+activation into its own scratch slice and multiply a static NB_COLS-aligned
+share of the weight rows, instead of thread 0 quantizing, all threads
+meeting at a barrier and then taking dynamic chunks. That removes one of
+the two barriers of each matmul. The redundant work is nth-1 quantizations
+of one row. Results are bit-identical to the default path.
+
+Part of Bonsai-Oryon (https://github.com/SatoruGoj0/Bonsai-Oryon).
+---
+ ggml/src/ggml-cpu/repack.cpp | 68 +++++++++++++++++++++++++++++++++++-
+ 1 file changed, 67 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cpu/repack.cpp b/ggml/src/ggml-cpu/repack.cpp
+index 6e5ae96..7729a60 100644
+--- a/ggml/src/ggml-cpu/repack.cpp
++++ b/ggml/src/ggml-cpu/repack.cpp
+@@ -5317,14 +5317,39 @@ class tensor_traits_base : public ggml::cpu::tensor_traits {
+     virtual int repack(struct ggml_tensor * t, const void * data, size_t data_size) = 0;
+ };
+ 
++// Bonsai-Oryon: BONSAI_TG_NOBARRIER=1 - for single-token (and <4-token) matrix-vector products every thread
++// quantizes the activation row(s) into its own scratch slice and multiplies a static, NB_COLS-aligned share of
++// the weight rows. That removes the barrier between activation quantization and the GEMV (one of the two
++// barriers per matmul) at the cost of nth-1 redundant quantizations of a single row (microseconds) and of
++// the dynamic chunk scheduling. Results are bit-identical (same quantization, same per-row kernels).
++static bool bonsai_tg_nobarrier() {
++    static const bool on = [] {
++        const char * e = getenv("BONSAI_TG_NOBARRIER");
++        return e != nullptr && e[0] == '1';
++    }();
++    return on;
++}
++
++static inline bool bonsai_tg_nobarrier_applies(const struct ggml_tensor * op) {
++    const struct ggml_tensor * src1 = op->src[1];
++    return bonsai_tg_nobarrier() && src1->ne[1] < 4 && src1->ne[2] == 1 && src1->ne[3] == 1 && !ggml_is_numa();
++}
++
+ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PARAM_TYPE> class tensor_traits : public tensor_traits_base {
+ 
+-    bool work_size(int /* n_threads */, const struct ggml_tensor * op, size_t & size) override {
++    static size_t bonsai_tg_slice(const struct ggml_tensor * op) {
++        return GGML_PAD(ggml_row_size(PARAM_TYPE, ggml_nelements(op->src[1])), 64);
++    }
++
++    bool work_size(int n_threads, const struct ggml_tensor * op, size_t & size) override {
+         // not realy a GGML_TYPE_Q8_0 but same size.
+         switch (op->op) {
+             case GGML_OP_MUL_MAT:
+                 {
+                     size = ggml_row_size(PARAM_TYPE, ggml_nelements(op->src[1]));
++                    if (bonsai_tg_nobarrier_applies(op)) {
++                        size = bonsai_tg_slice(op) * (size_t) n_threads + 64;
++                    }
+                     return true;
+                 }
+             case GGML_OP_MUL_MAT_ID:
+@@ -5412,6 +5437,42 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
+         }
+     }
+ 
++    void forward_mul_mat_tg_nobarrier(ggml_compute_params * params, ggml_tensor * op) {
++        const ggml_tensor * src0 = op->src[0];
++        const ggml_tensor * src1 = op->src[1];
++        ggml_tensor *       dst  = op;
++
++        GGML_TENSOR_BINARY_OP_LOCALS
++
++        const int ith = params->ith;
++        const int nth = params->nth;
++
++        // static share of the NB_COLS row groups
++        const int64_t ngroups = (ne01 + NB_COLS - 1) / NB_COLS;
++        const int64_t g0      = ngroups * ith / nth;
++        const int64_t g1      = ngroups * (ith + 1) / nth;
++        const int64_t r0      = g0 * NB_COLS;
++        const int64_t r1      = MIN(g1 * NB_COLS, ne01);
++        if (r0 >= r1) {
++            return;
++        }
++
++        const size_t slice = bonsai_tg_slice(op);
++        char * wdata = (char *) GGML_PAD((uintptr_t) params->wdata, 64) + slice * ith;
++        GGML_ASSERT(wdata + slice <= (char *) params->wdata + params->wsize);
++
++        const size_t nbw1 = ggml_row_size(PARAM_TYPE, ne10);
++        for (int64_t i11 = 0; i11 < ne11; i11++) {
++            ggml_repack_quantize_row<BLOC_TYPE, INTER_SIZE, PARAM_TYPE>((float *) ((char *) src1->data + i11 * nb11),
++                                                                        (void *) (wdata + i11 * nbw1), ne10);
++        }
++        for (int64_t i11 = 0; i11 < ne11; i11++) {
++            gemv<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(ne00, (float *) ((char *) dst->data + i11 * nb1) + r0,
++                                                             ne01, (const char *) src0->data + r0 * nb01,
++                                                             wdata + i11 * nbw1, 1 /* nrows */, r1 - r0);
++        }
++    }
++
+     void forward_mul_mat(ggml_compute_params * params, ggml_tensor * op) {
+         const ggml_tensor * src0 = op->src[0];
+         const ggml_tensor * src1 = op->src[1];
+@@ -5444,6 +5505,11 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
+         GGML_ASSERT(ggml_n_dims(op->src[0]) == 2);
+         // GGML_ASSERT(ggml_n_dims(op->src[1]) == 2);
+ 
++        if (bonsai_tg_nobarrier_applies(op)) {
++            forward_mul_mat_tg_nobarrier(params, op);
++            return;
++        }
++
+         char *       wdata = static_cast<char *>(params->wdata);
+         const size_t nbw1  = ggml_row_size(PARAM_TYPE, ne10);
+         const size_t nbw2  = nbw1 * ne11;

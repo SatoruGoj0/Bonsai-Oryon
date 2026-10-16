@@ -1,3 +1,18 @@
+bonsai-oryon (0.3.0) experimental; urgency=low
+
+  * CPU backend modules now use ggml's own threadpool instead of OpenMP; the
+    OpenMP-threaded modules of v0.2 are kept in /usr/lib/bonsai-oryon/omp.
+  * 0007: BONSAI_PROFILE=1 graph profiler; bounded spin-then-yield barrier
+    (BONSAI_BARRIER_SPIN).
+  * 0008: --oryon-profile balanced|throughput|low-power|auto|none (default
+    auto for cli/server, reads the profile written by bonsai-tune).
+  * 0009: opt-in barrier-free single-token matmul (BONSAI_TG_NOBARRIER=1).
+  * New /usr/bin/bonsai-tune; rewritten bonsai-benchmark.sh (interleaved
+    randomized rounds, condition tracking, confidence intervals); helper to
+    run older release .debs without installing them.
+
+ -- SatoruGoj0 <SatoruGoj0@users.noreply.github.com>  Fri, 16 Oct 2026 23:00:00 +0000
+
 bonsai-oryon (0.2.0) experimental; urgency=low
 
   * 0005: 4-row interleaved PQ2_0 layout (CPU_REPACK) for single-token decoding.

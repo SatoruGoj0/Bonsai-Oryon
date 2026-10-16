@@ -429,7 +429,8 @@ static void test_repack_4row() {
     CHECK(buft != nullptr, "CPU_REPACK buffer type not available");
     if (!buft) return;
     ggml_backend_t be = ggml_backend_cpu_init();
-    ggml_backend_cpu_set_n_threads(be, 4);
+    const char * tt = getenv("BONSAI_TEST_THREADS");   // CI runs 1, 3 and 4 threads
+    ggml_backend_cpu_set_n_threads(be, tt && atoi(tt) > 0 ? atoi(tt) : 4);
     const char * te = getenv("BONSAI_PQ2_TERNARY");
     const bool tern_mode = te && te[0] == '1';
     struct Case { int64_t K, M; bool ternary_data; } cases[] = {

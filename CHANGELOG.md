@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.3.0 (2026-10-16), experimental
+
+Focus: threading and synchronization of single-token decoding on Snapdragon X, measurement tooling.
+
+- **Threadpool instead of OpenMP (default).** The packaged CPU modules are built with `GGML_OPENMP=OFF`, so
+  ggml's persistent threadpool is used: workers spin inside a graph and sleep (after polling, `--poll`) between
+  graphs, instead of libgomp's spin-then-futex barrier on every node. The v0.2 OpenMP modules (same kernels)
+  are still shipped in `/usr/lib/bonsai-oryon/omp` (`BONSAI_BACKEND_DIR=/usr/lib/bonsai-oryon/omp`).
+- **0007** graph profiler (`BONSAI_PROFILE=1`: per-op time, compute vs barrier wait, wake-up latency) and a
+  bounded barrier spin (`BONSAI_BARRIER_SPIN`, default 65536 spins then `sched_yield()`; `-1` = upstream pure
+  spin). No unbounded busy-wait is enabled by default.
+- **0008** `--oryon-profile balanced|throughput|low-power|auto|none` for cli, server and bench. `auto` (default
+  for cli/server) uses the per-user profile written by the new `bonsai-tune`, else `balanced`
+  (4 threads on 8-core Snapdragon X). Explicit `-t/-tb/--poll/-C` always win.
+- **0009** opt-in barrier-free single-token matmul (`BONSAI_TG_NOBARRIER=1`), bit-identical results.
+- `bonsai-benchmark.sh` rewritten: shuffled interleaved rounds, warm-up, cooldowns, per-run temperature /
+  frequency cap / load / power-source recording with drift flags, mean/sd/95% CI, separate load-time/RSS
+  measurement, `--short`/`--full`, `--release-deb` to compare older releases without installing them.
+- New tests: bit-identical logits across thread counts, threading backends, barrier policies and the
+  barrier-free path; 2048-token context vs upstream; profiles; profiler; real-model server tool calling.
+
 ## 0.2.0 (2026-10-16), experimental
 
 Focus: single-token decoding (tg). Upstream is unchanged (PrismML `prism` @ `e3de715`); patches 0001–0004

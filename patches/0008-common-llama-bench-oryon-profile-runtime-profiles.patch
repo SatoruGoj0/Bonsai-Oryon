@@ -1,0 +1,307 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 16 Oct 2026 17:59:53 +0000
+Subject: [PATCH 8/9] common, llama-bench: --oryon-profile runtime profiles
+
+--oryon-profile balanced|throughput|low-power|auto|none (environment
+BONSAI_ORYON_PROFILE) fills the generation / batch thread counts, the poll
+level, an optional CPU mask and the barrier spin limit, but only for the
+settings that were not given explicitly (-t, -tb, --poll, -C always win).
+
+  balanced   generation and batch threads = all CPUs up to 4, else
+             max(4, ncpu/2): on Snapdragon X (8 cores) 4 threads decoded
+             2.8x faster than 8 in a desktop session
+  throughput balanced generation, batch (prompt) processing on all CPUs
+  low-power  half of balanced, no polling, yield immediately in barriers
+  auto       the tuned profile written by bonsai-tune
+             ($XDG_CONFIG_HOME/bonsai-oryon/profile, only if it was
+             measured with the same number of CPUs), else balanced
+
+auto is the default of llama-cli, llama-server and llama-completion; it
+only reads a small file, there is no start-up measurement. llama-bench
+applies a profile only when --oryon-profile is given. The chosen profile
+is logged.
+
+Part of Bonsai-Oryon (https://github.com/SatoruGoj0/Bonsai-Oryon).
+---
+ common/arg.cpp                    | 54 ++++++++++++++++++
+ common/common.cpp                 | 93 +++++++++++++++++++++++++++++++
+ common/common.h                   | 16 ++++++
+ tools/llama-bench/llama-bench.cpp | 26 +++++++++
+ 4 files changed, 189 insertions(+)
+
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 94dead3..8a10d1e 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -759,6 +759,49 @@ static void common_params_apply_system_config(common_params & params, llama_exam
+     }
+ }
+ 
++// Bonsai-Oryon: --oryon-profile (or BONSAI_ORYON_PROFILE); applied after all other options, filling only
++// thread/poll/affinity settings that were not given explicitly
++static std::string g_bonsai_oryon_profile;
++
++static void bonsai_apply_oryon_profile(common_params & params, enum llama_example ex) {
++    std::string name = g_bonsai_oryon_profile;
++    if (name.empty()) {
++        const char * e = getenv("BONSAI_ORYON_PROFILE");
++        if (e && e[0]) name = e;
++    }
++    if (name.empty()) {
++        // default for the interactive tools: auto (tuned profile if present, else the balanced heuristic)
++        if (ex != LLAMA_EXAMPLE_CLI && ex != LLAMA_EXAMPLE_SERVER && ex != LLAMA_EXAMPLE_COMPLETION) return;
++        name = "auto";
++    }
++    if (name == "none") return;
++    common_oryon_profile p;
++    std::string err;
++    if (!common_oryon_profile_resolve(name, p, err)) {
++        throw std::invalid_argument(err);
++    }
++    const bool user_t  = params.cpuparams.n_threads > 0;
++    const bool user_tb = params.cpuparams_batch.n_threads > 0;
++    if (!user_t)  params.cpuparams.n_threads       = p.n_threads;
++    if (!user_tb) params.cpuparams_batch.n_threads = user_t ? params.cpuparams.n_threads : p.n_threads_batch;
++    if (p.poll >= 0) {
++        if (params.cpuparams.poll == 50)       params.cpuparams.poll       = (uint32_t) p.poll;
++        if (params.cpuparams_batch.poll == 50) params.cpuparams_batch.poll = (uint32_t) p.poll;
++    }
++    if (!p.cpu_mask.empty() && !params.cpuparams.mask_valid && !user_t) {
++        if (parse_cpu_mask(p.cpu_mask, params.cpuparams.cpumask)) {
++            params.cpuparams.mask_valid = true;
++            params.cpuparams.strict_cpu = p.cpu_strict;
++        }
++    }
++    if (!p.barrier_spin.empty()) {
++        setenv("BONSAI_BARRIER_SPIN", p.barrier_spin.c_str(), 0);
++    }
++    LOG_INF("bonsai-oryon profile %s (%s): threads %d%s, batch threads %d%s, poll %u%s\n", p.name.c_str(), p.source.c_str(),
++            params.cpuparams.n_threads, user_t ? " (from -t)" : "", params.cpuparams_batch.n_threads, user_tb ? " (from -tb)" : "",
++            params.cpuparams.poll, params.cpuparams.mask_valid ? ", cpu mask set" : "");
++}
++
+ static bool common_params_parse_ex(int argc, char ** argv, common_params_context & ctx_arg) {
+     common_params & params = ctx_arg.params;
+ 
+@@ -888,6 +931,8 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
+     // parse all CLI args now, so that -hf is available below for remote preset resolution
+     parse_cli_args();
+ 
++    bonsai_apply_oryon_profile(params, ctx_arg.ex);
++
+     postprocess_cpu_params(params.cpuparams,       nullptr);
+     postprocess_cpu_params(params.cpuparams_batch, &params.cpuparams);
+ 
+@@ -1510,6 +1555,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+             }
+         }
+     ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP}));
++    add_opt(common_arg(
++        {"--oryon-profile"}, "NAME",
++        "Bonsai-Oryon runtime profile: balanced, throughput, low-power, auto (tuned profile from bonsai-tune if\n"
++        "present, else balanced) or none. Fills only the thread/poll settings not given explicitly\n"
++        "(default: auto for cli/server/completion)",
++        [](common_params &, const std::string & value) {
++            g_bonsai_oryon_profile = value;
++        }
++    ).set_env("BONSAI_ORYON_PROFILE"));
+     add_opt(common_arg(
+         {"-t", "--threads"}, "N",
+         string_format("number of CPU threads to use during generation (default: %d)", params.cpuparams.n_threads),
+diff --git a/common/common.cpp b/common/common.cpp
+index 4045903..7553b77 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -16,6 +16,9 @@
+ #include <cmath>
+ #include <chrono>
+ #include <cstdarg>
++#if defined(__linux__)
++#include <sched.h>
++#endif
+ #include <cstring>
+ #include <ctime>
+ #include <filesystem>
+@@ -75,6 +78,96 @@ common_time_meas::~common_time_meas() {
+ // CPU utils
+ //
+ 
++//
++// Bonsai-Oryon runtime profiles
++//
++
++int common_oryon_available_cpus() {
++#if defined(__linux__)
++    cpu_set_t set;
++    if (sched_getaffinity(0, sizeof(set), &set) == 0) {
++        const int n = CPU_COUNT(&set);
++        if (n > 0) return n;
++    }
++#endif
++    const unsigned n = std::thread::hardware_concurrency();
++    return n > 0 ? (int) n : 1;
++}
++
++static std::string common_oryon_profile_path() {
++    const char * xdg  = getenv("XDG_CONFIG_HOME");
++    const char * home = getenv("HOME");
++    if (xdg && xdg[0]) return std::string(xdg) + "/bonsai-oryon/profile";
++    if (home && home[0]) return std::string(home) + "/.config/bonsai-oryon/profile";
++    return "";
++}
++
++// tuned profile written by bonsai-tune: key=value lines; only used if it was measured on the same CPU count
++static bool common_oryon_profile_load_tuned(common_oryon_profile & out, int ncpu) {
++    const std::string path = common_oryon_profile_path();
++    if (path.empty()) return false;
++    std::ifstream f(path);
++    if (!f) return false;
++    common_oryon_profile p;
++    int file_ncpu = -1;
++    std::string line;
++    while (std::getline(f, line)) {
++        const size_t eq = line.find('=');
++        if (line.empty() || line[0] == '#' || eq == std::string::npos) continue;
++        const std::string k = line.substr(0, eq), v = line.substr(eq + 1);
++        try {
++            if      (k == "threads")       p.n_threads       = std::stoi(v);
++            else if (k == "threads_batch") p.n_threads_batch = std::stoi(v);
++            else if (k == "poll")          p.poll            = std::stoi(v);
++            else if (k == "cpu_mask")      p.cpu_mask        = v;
++            else if (k == "cpu_strict")    p.cpu_strict      = v == "1";
++            else if (k == "barrier_spin")  p.barrier_spin    = v;
++            else if (k == "ncpu")          file_ncpu         = std::stoi(v);
++        } catch (...) {
++            return false;
++        }
++    }
++    if (file_ncpu != ncpu || p.n_threads <= 0 || p.n_threads > ncpu) return false;
++    if (p.n_threads_batch <= 0 || p.n_threads_batch > ncpu) p.n_threads_batch = p.n_threads;
++    p.source = path;
++    out = p;
++    return true;
++}
++
++bool common_oryon_profile_resolve(const std::string & name, common_oryon_profile & out, std::string & err) {
++    const int ncpu = common_oryon_available_cpus();
++    // Generation threads. Measured on Snapdragon X (8 cores, desktop session): tg128 8.4 / 5.2 / 4.2 / 3.0 tok/s
++    // with 4 / 6 / 7 / 8 threads, i.e. leaving cores free for the rest of the system matters more than more
++    // threads. Small machines use all cores. bonsai-tune measures the actual machine and overrides this.
++    const int bal = ncpu <= 4 ? ncpu : std::max(4, ncpu / 2);
++    out = common_oryon_profile();
++    out.source = "built-in heuristic";
++    if (name == "auto") {
++        if (common_oryon_profile_load_tuned(out, ncpu)) {
++            out.name = "auto(tuned)";
++            return true;
++        }
++        out.name = "auto(balanced)";
++        out.n_threads = bal; out.n_threads_batch = bal; out.poll = 50;
++        return true;
++    }
++    out.name = name;
++    if (name == "balanced") {
++        out.n_threads = bal; out.n_threads_batch = bal; out.poll = 50;
++    } else if (name == "throughput") {
++        // generation as balanced, prompt/batch processing on every core
++        out.n_threads = bal; out.n_threads_batch = ncpu; out.poll = 50;
++    } else if (name == "low-power") {
++        // fewer threads, no polling between graphs, yield immediately in barriers
++        out.n_threads = std::max(1, bal / 2); out.n_threads_batch = std::max(1, bal / 2); out.poll = 0;
++        out.barrier_spin = "0";
++    } else {
++        err = "unknown --oryon-profile '" + name + "' (expected balanced, throughput, low-power or auto)";
++        return false;
++    }
++    return true;
++}
++
+ int32_t common_cpu_get_num_physical_cores() {
+ #if defined(_AIX)
+     int32_t logical_cpus = _system_configuration.ncpus;
+diff --git a/common/common.h b/common/common.h
+index 0ab2a3f..27589a1 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -73,6 +73,22 @@ struct common_cpu_params {
+     uint32_t poll                        = 50;      // Polling (busywait) level (0 - no polling, 100 - mostly polling)
+ };
+ 
++// Bonsai-Oryon runtime profiles (--oryon-profile balanced|throughput|low-power|auto).
++// A profile only fills settings the user did not give explicitly.
++struct common_oryon_profile {
++    std::string name;
++    std::string source;          // "built-in heuristic" or the tuned profile file
++    int         n_threads       = -1;
++    int         n_threads_batch = -1;
++    int         poll            = -1;   // -1: keep the default
++    std::string cpu_mask;               // hex, empty: no affinity
++    bool        cpu_strict      = false;
++    std::string barrier_spin;           // exported as BONSAI_BARRIER_SPIN if that is unset; empty: keep
++};
++// returns false (and fills err) for an unknown profile name
++bool common_oryon_profile_resolve(const std::string & name, common_oryon_profile & out, std::string & err);
++int  common_oryon_available_cpus();
++
+ int32_t common_cpu_get_num_physical_cores();
+ int32_t common_cpu_get_num_math();
+ 
+diff --git a/tools/llama-bench/llama-bench.cpp b/tools/llama-bench/llama-bench.cpp
+index a2da93b..d50ad4d 100644
+--- a/tools/llama-bench/llama-bench.cpp
++++ b/tools/llama-bench/llama-bench.cpp
+@@ -449,6 +449,7 @@ static void print_usage(int /* argc */, char ** argv) {
+     printf("  -ctk, --cache-type-k <t>                          (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_k, ggml_type_name), ",").c_str());
+     printf("  -ctv, --cache-type-v <t>                          (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_v, ggml_type_name), ",").c_str());
+     printf("  -t, --threads <n>                                 (default: %s)\n", join(cmd_params_defaults.n_threads, ",").c_str());
++    printf("  --oryon-profile <name>                            Bonsai-Oryon profile: balanced|throughput|low-power|auto (fills -t/--poll)\n");
+     printf("  -C, --cpu-mask <hex,hex>                          (default: %s)\n", join(cmd_params_defaults.cpu_mask, ",").c_str());
+     printf("  --cpu-strict <0|1>                                (default: %s)\n", join(cmd_params_defaults.cpu_strict, ",").c_str());
+     printf("  --poll <0...100>                                  (default: %s)\n", join(cmd_params_defaults.poll, ",").c_str());
+@@ -505,6 +506,7 @@ static ggml_type ggml_type_from_name(const std::string & s) {
+ }
+ 
+ static cmd_params parse_cmd_params(int argc, char ** argv) {
++    std::string oryon_profile;
+     cmd_params        params;
+     std::string       arg;
+     bool              invalid_param = false;
+@@ -693,6 +695,12 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
+                 }
+                 auto p = string_split<bool>(argv[i], split_delim);
+                 params.cpu_strict.insert(params.cpu_strict.end(), p.begin(), p.end());
++            } else if (arg == "--oryon-profile") {
++                if (++i >= argc) {
++                    invalid_param = true;
++                    break;
++                }
++                oryon_profile = argv[i];
+             } else if (arg == "--poll") {
+                 if (++i >= argc) {
+                     invalid_param = true;
+@@ -1164,6 +1172,24 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
+     if (params.no_host.empty()) {
+         params.no_host = cmd_params_defaults.no_host;
+     }
++    // Bonsai-Oryon: --oryon-profile fills only -t / --poll / -C / --cpu-strict when they were not given
++    if (!oryon_profile.empty()) {
++        common_oryon_profile prof;
++        std::string err;
++        if (!common_oryon_profile_resolve(oryon_profile, prof, err)) {
++            fprintf(stderr, "error: %s\n", err.c_str());
++            exit(1);
++        }
++        if (params.n_threads.empty())  params.n_threads = { prof.n_threads };
++        if (params.poll.empty() && prof.poll >= 0) params.poll = { prof.poll };
++        if (params.cpu_mask.empty() && !prof.cpu_mask.empty()) {
++            params.cpu_mask   = { prof.cpu_mask };
++            if (params.cpu_strict.empty()) params.cpu_strict = { prof.cpu_strict };
++        }
++        if (!prof.barrier_spin.empty()) setenv("BONSAI_BARRIER_SPIN", prof.barrier_spin.c_str(), 0);
++        fprintf(stderr, "bonsai-oryon profile %s (%s): threads %d (prompt and generation tests use the same count here)\n",
++                prof.name.c_str(), prof.source.c_str(), params.n_threads[0]);
++    }
+     if (params.n_threads.empty()) {
+         params.n_threads = cmd_params_defaults.n_threads;
+     }
