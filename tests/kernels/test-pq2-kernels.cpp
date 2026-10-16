@@ -344,16 +344,19 @@ static void bench() {
 #if defined(__ARM_NEON) && defined(__aarch64__)
     const auto * cpu = ggml_get_type_traits_cpu(GGML_TYPE_PQ2_0);
     const auto * q8k = ggml_get_type_traits_cpu(GGML_TYPE_Q8_K);
-    const int64_t K = 4096, M = 1024; // 1024 rows of a 4096-wide matrix ~ 4.4 MB of PQ2_0 weights
+    // M=32: 35 KB of weights (L1/L2-resident -> compute-bound); M=8192: 8.9 MB (beyond L2 -> memory side)
+    for (const int64_t M : {(int64_t) 32, (int64_t) 8192}) {
+    const int64_t K = 4096;
     auto w = random_pq2(K * M);
     auto a = random_act(K);
     std::vector<block_q8_K> y(K / 256);
     q8k->from_float(a.data(), y.data(), K);
     std::vector<float> out(M);
     const size_t row = (K / 128) * sizeof(block_pq2_0);
+    const int reps = M <= 64 ? 2000 : 15;
     auto time_it = [&](auto fn) {
         double best = 1e30;
-        for (int rep = 0; rep < 15; ++rep) {
+        for (int rep = 0; rep < reps; ++rep) {
             auto t0 = std::chrono::steady_clock::now();
             for (int64_t m = 0; m < M; ++m) fn(m);
             auto t1 = std::chrono::steady_clock::now();
@@ -364,9 +367,10 @@ static void bench() {
     const double t_old = time_it([&](int64_t m) { upstream_vec_dot_pq2_0_q8_K((int) K, &out[m], (const char *) w.data() + m * row, y.data()); });
     const double t_new = time_it([&](int64_t m) { cpu->vec_dot((int) K, &out[m], 0, (const char *) w.data() + m * row, 0, y.data(), 0, 1); });
     const double gw_old = (double) (K * M) / t_old / 1e9, gw_new = (double) (K * M) / t_new / 1e9;
-    std::printf("[bench] single-thread GEMV 4096x1024 PQ2_0 (this CPU, not Snapdragon X unless stated):\n");
-    std::printf("[bench]   upstream kernel: %8.3f ms  (%.2f Gweights/s)\n", t_old * 1e3, gw_old);
-    std::printf("[bench]   bonsai kernel  : %8.3f ms  (%.2f Gweights/s)  speedup x%.2f\n", t_new * 1e3, gw_new, t_old / t_new);
+    std::printf("[bench] single-thread GEMV 4096x%" PRId64 " PQ2_0 (%.2f MB weights; this CPU, not Snapdragon X):\n", M, K * M * 34.0 / 128 / 1e6);
+    std::printf("[bench]   upstream kernel: %9.4f ms  (%.2f Gweights/s)\n", t_old * 1e3, gw_old);
+    std::printf("[bench]   bonsai kernel  : %9.4f ms  (%.2f Gweights/s)  speedup x%.2f\n", t_new * 1e3, gw_new, t_old / t_new);
+    }
 
     // quantize_row_q8_K
     auto big = random_act(12288);
