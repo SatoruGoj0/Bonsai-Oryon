@@ -171,13 +171,13 @@ jobs:
           SRV=$!
           for i in $(seq 1 600); do curl -sf http://127.0.0.1:18090/health >/dev/null && break; sleep 1; done
           grep -m1 'bonsai-oryon profile' /tmp/srv.log | sed 's/^/- /' >> $R
-          curl -s http://127.0.0.1:18090/v1/chat/completions -H 'Content-Type: application/json' -d '{"model":"bonsai","temperature":0,"max_tokens":64,"messages":[{"role":"user","content":"What is the capital of France? Answer in one word."}]}' > /tmp/chat.json
+          curl -s http://127.0.0.1:18090/v1/chat/completions -H 'Content-Type: application/json' -d '{"model":"bonsai","temperature":0,"max_tokens":512,"messages":[{"role":"user","content":"What is the capital of France? Answer in one word."}]}' > /tmp/chat.json
           curl -sN http://127.0.0.1:18090/v1/chat/completions -H 'Content-Type: application/json' -d '{"model":"bonsai","temperature":0,"max_tokens":32,"stream":true,"messages":[{"role":"user","content":"Count from 1 to 5."}]}' > /tmp/stream.txt
           curl -s http://127.0.0.1:18090/v1/chat/completions -H 'Content-Type: application/json' -d '{"model":"bonsai","temperature":0,"max_tokens":256,"messages":[{"role":"user","content":"What is the weather in Paris right now? Use the tool."}],"tools":[{"type":"function","function":{"name":"get_weather","description":"Get the current weather for a city","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}]}' > /tmp/tools.json
           python3 - >> $R <<'PY'
           import json
           c = json.load(open("/tmp/chat.json"))["choices"][0]["message"]
-          print(f"- chat: {c.get('content','')[:200]!r} (contains 'Paris': {'paris' in (c.get('content') or '').lower()})")
+          print(f"- chat: content {(c.get('content') or '')[:200]!r}, reasoning_content {len(c.get('reasoning_content') or '')} chars (answer contains 'Paris': {'paris' in ((c.get('content') or '') + (c.get('reasoning_content') or '')).lower()})")
           chunks = [l for l in open("/tmp/stream.txt") if l.startswith("data: {")]
           done = any(l.startswith("data: [DONE]") for l in open("/tmp/stream.txt"))
           text = "".join((json.loads(l[6:])["choices"][0]["delta"].get("content") or "") for l in chunks if json.loads(l[6:])["choices"])

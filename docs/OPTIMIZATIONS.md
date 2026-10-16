@@ -249,3 +249,123 @@ pp is preserved and improved (+33% over v0.1). KL divergence against the unpatch
   threading is the limit → E1/E3 tell which thread count/placement works best.
 * E1 thread sweep 4/6/7/8, E2 layouts (v0.1 path / 4-row / ternary), E3 OpenMP placement, all with
   `-r 3`, plus CPU-frequency, devfreq (memory-controller) and thermal snapshots before/after.
+
+# v0.3: threading and synchronization
+
+## 8. What the Snapdragon X v0.2 numbers say
+
+User measurement on the laptop, v0.2.0 (OpenMP build), on battery, with background load:
+
+| threads | pp256 | tg128 |
+|---|---|---|
+| 4 | 26.03 | 8.40 |
+| 6 | 19.30 | 5.15 |
+| 7 | 17.69 | 4.20 |
+| 8 | 19.71 | 3.04 |
+
+`bonsai-diag` on the same machine: DRAM read 103.5 GB/s and 4-row GEMV 110.9 GB/s at 8 threads, i.e. the
+matmuls alone would allow roughly 45-50 tok/s at 8 threads. At 4 threads tg128 = 8.40 tok/s is ~120 ms per
+token while the GEMV share is ~30-40 ms. The remaining time is not in the kernels. A token is 1185 graph
+nodes (measured with the v0.3 profiler); every node ends with a barrier, so a decode step has ~1200
+synchronization points. On 8 threads
+with a desktop running, one preempted worker stalls the other seven at the next barrier. libgomp's barrier
+spins for a while and then sleeps on a futex, so each stall costs a wake-up. That explains why throughput
+falls monotonically from 4 to 8 threads, and why `OMP_WAIT_POLICY=active` helped at 4 threads (8.94 vs 7.56).
+
+## 9. Implemented in v0.3
+
+* **ggml threadpool instead of OpenMP (build change).** The default CPU modules are built with
+  `GGML_OPENMP=OFF`, so the persistent ggml threadpool (created once per context by llama.cpp's common code)
+  runs graphs: workers spin on an atomic barrier inside a graph and, between graphs, poll for `--poll`
+  (default 50) and then sleep on a condition variable, so an idle server costs nothing. The OpenMP modules
+  are still built from the same sources and shipped in `/usr/lib/bonsai-oryon/omp` for A/B and fallback.
+* **0007 bounded spin, then yield.** Upstream's threadpool barrier spins without bound. When there are more
+  runnable threads than free cores, the spinning waiters take the cores the late worker needs. That is the
+  failure the laptop numbers show. After `BONSAI_BARRIER_SPIN` iterations (default 4096) the waiters call
+  `sched_yield()` between checks. In qemu with 8 threads on 4 cores (only indicative): unbounded spin 4 tok/s,
+  65536 → 46, 1024 → 175, 0 → 193, OpenMP 115, and with 4 threads all policies were equal (≈410-430).
+  This is not an unbounded busy-wait: after the bound, the CPU is handed to whoever needs it.
+* **0007 profiler.** `BONSAI_PROFILE=1` prints, at exit, thread-0 compute time per op, per-thread compute
+  vs barrier/imbalance wait, worker wake-up latency per graph and the graph wall time. The disabled cost is
+  one predictable branch per node. Use `bonsai-bench -p 0 -n 64` to profile decoding only.
+* **0008 `--oryon-profile`.** Default `auto`: per-user file from `bonsai-tune`, else `balanced`
+  (4 threads on 8 cores). Explicit flags always win. No start-up measurement.
+* **0009 barrier-free single-token matmul (opt-in, `BONSAI_TG_NOBARRIER=1`).** For <4 activation rows each
+  thread quantizes the activation itself and multiplies a static share of the rows, removing the
+  quantize→GEMV barrier (one of the two per matmul). Bit-identical results.
+
+All variants are checked in CI for bit-identical logits (thread counts 1/2/3/4, threadpool vs OpenMP,
+barrier policies, barrier-free path, ternary layout; batched and token-by-token).
+
+## 10. Measurements of v0.3 on the CI runner (Neoverse N2, 4 vCPU, real 9B model; not Snapdragon X)
+
+[model-validation run 38946610464](https://github.com/SatoruGoj0/Bonsai-Oryon/actions/runs/38946610464),
+artifacts of [CI run 38945705618](https://github.com/SatoruGoj0/Bonsai-Oryon/actions/runs/38945705618), all
+configurations back to back on one runner, `-r 3`:
+
+| build | pp256 t=4 | tg128 t=1 | tg128 t=2 | tg128 t=4 |
+|---|---|---|---|---|
+| upstream (e3de715 kernels, OpenMP) | 8.97 | 1.89 | 3.65 | 6.87 |
+| v0.1 equivalent (plain kernels, OpenMP modules) | 13.87 | 2.21 | 4.26 | 8.00 |
+| v0.2 equivalent (4-row, OpenMP modules) | 18.39 | 3.00 | 5.73 | 10.56 |
+| **v0.3 default (4-row, threadpool, spin 4096)** | **18.44** | **2.99** | **5.76** | **10.65** |
+| v0.3 + `BONSAI_TG_NOBARRIER=1` | 18.40 | 2.98 | 5.74 | 10.74 |
+| v0.3, pure spin (`BONSAI_BARRIER_SPIN=-1`) | 18.48 | 2.97 | 5.73 | 10.63 |
+| v0.3, yield at once (`BONSAI_BARRIER_SPIN=0`) | 18.38 | 2.97 | 5.62 | 10.31 |
+| v0.3, ternary layout | 11.87 | 1.84 | 3.57 | 6.77 |
+
+On an idle machine the threading backend does not matter (all within ~1%): the profiler shows 92.9% compute
+and 7.1% barrier/imbalance wait per thread, 88% of thread-0 time in the PQ2_0 GEMV (400 µs per call), and a
+worker wake-up of 0.6 µs per graph for the threadpool vs 30.6 µs for OpenMP.
+
+The difference shows when the machine is busy. tg64 with as many threads as vCPUs, and with twice as many
+(every worker competes with another runnable thread, like a desktop under load):
+
+| configuration | t=4 | t=8 (oversubscribed) |
+|---|---|---|
+| **v0.3 default (spin 4096, then yield)** | 10.37 | **9.76** (−6%) |
+| spin 0 (yield at once) | 10.44 | 9.93 |
+| spin 65536 | 10.44 | 7.79 |
+| unbounded spin (upstream threadpool behaviour) | 10.60 | **0.23** (−98%) |
+| v0.2 OpenMP modules | 10.49 | 8.56 (−18%) |
+| upstream OpenMP build | 6.92 | 6.00 |
+
+So the bound on the spin is what makes the threadpool usable at all on a loaded machine (upstream's unbounded
+spin is 45× slower), and with it v0.3 keeps 94% of its throughput under 2× oversubscription where v0.2's
+OpenMP keeps 82%. Whether this closes the gap on the laptop (8.40 at 4 threads vs 3.04 at 8) has to be
+measured there; the N2 runner has no desktop, no heterogeneous clusters and no thermal limit.
+
+The barrier-free matmul (0009) is within noise on N2 (+0.8% tg at t=4); it stays opt-in until measured on Oryon.
+
+**Memory / load** (warm page cache, one 1-token run):
+
+| layout | load | wall s | peak RSS MiB |
+|---|---|---|---|
+| 4-row (default) | mmap | 1.43 | 4416 |
+| 4-row | `--no-mmap` | 1.78 | 2655 |
+| plain (`BONSAI_PQ2_REPACK=0`) | mmap | 0.77 | 2525 |
+| plain | `--no-mmap` | 1.41 | 2525 |
+
+With mmap the repacked copy (anonymous memory) and the mapped file pages are both counted in RSS. The file
+pages are clean page cache and the kernel can drop them, but they occupy memory until it does. On a 16 GB
+laptop `--no-mmap` (or `-mmp 0` for bonsai-bench) saves ~1.7 GB RSS for ~0.3 s more load time.
+
+**Server** (real model, `--jinja`): `/v1/chat/completions` with tools returned
+`finish_reason=tool_calls` and `get_weather({"city":"Paris"})`; streaming delivered 34 SSE chunks and `[DONE]`.
+With 32-64 `max_tokens` the visible `content` was empty because the model was still in its thinking
+section (returned as `reasoning_content`), so use a larger `max_tokens` or disable thinking in the chat template
+for short answers.
+
+## 11. Remaining bottlenecks and v0.4 directions
+
+* On idle hardware tg is the PQ2_0 GEMV (88%). N2 is compute-bound at ~25 GB/s per 4 threads; Oryon reached
+  110.9 GB/s at 8 threads in `bonsai-diag`, so on the laptop the kernel is not the limit but scheduling is.
+* Synchronization: ~1200 barriers per token. v0.4 candidates: fuse elementwise chains (norm·mul, GLU, add) into
+  their producer so they need no barrier; let threads skip the barrier for ops whose rows they own
+  (thread-affine row partition from one matmul to the next).
+* Heterogeneous clusters: Snapdragon X has several clusters; pinning one cluster (`bonsai-tune` tries this)
+  vs spreading.
+* Repack memory: drop the mmapped source pages after repacking (`madvise(MADV_DONTNEED)` / unmap the
+  repacked ranges) to get no-mmap RSS with mmap load times.
+* The ternary layout loses on N2 (compute-bound); only worth it if Oryon is memory-bound at the chosen
+  thread count, which `bonsai-diag` and `bonsai-benchmark.sh --full` show.
