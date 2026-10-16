@@ -82,6 +82,11 @@ fuses `iscale*x + magic` into one FMA (confirmed in the disassembly). A plain mu
 FCVTNS gave 39 mismatches in 1668 blocks, all on rounding ties. The patch therefore uses FMLA with the
 same magic constant, and the result has 0 mismatches.
 
+**Measured:** on the CI runner (Neoverse N2, single thread, 12288 floats) the NEON version is the same
+speed as the reference (8.84 µs each). GCC 14 at `-O3` already auto-vectorizes the reference loop
+well. The patch is kept because its output is bit-identical and it carries no risk, but it is **not**
+a source of speedup. Activation quantization is a negligible share of a token anyway.
+
 ### 0003: `armv8.6_nosve` CPU variant
 
 `GGML_CPU_ALL_VARIANTS` on Linux builds `armv8.0_1`, `armv8.2_{1,2,3}`, `armv8.6_{1,2}` and

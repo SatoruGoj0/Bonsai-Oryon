@@ -245,6 +245,10 @@ static void test_vec_dot_q8K() {
     const auto * q8k = ggml_get_type_traits_cpu(GGML_TYPE_Q8_K);
     CHECK(cpu->vec_dot_type == GGML_TYPE_Q8_K, "PQ2_0 vec_dot_type is not Q8_K");
     std::printf("[gemv] PQ2_0 vec_dot nrows=%" PRId64 "\n", cpu->nrows);
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    // guard against testing an unpatched tree: Bonsai-Oryon patch 0001 sets nrows = 2 on AArch64 NEON
+    CHECK(cpu->nrows == 2, "PQ2_0 nrows is %" PRId64 ": the Bonsai-Oryon kernel patch is not in this build", cpu->nrows);
+#endif
     double worst = 0.0;
     int bad2x2 = 0;
     const int64_t sizes[] = {256, 512, 768, 1280, 2048, 4096, 5120, 12288};

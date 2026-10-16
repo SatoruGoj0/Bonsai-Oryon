@@ -16,6 +16,10 @@ mkdir -p "${SRC_DIR}"
 log "exporting ${UPSTREAM_COMMIT} -> ${SRC_DIR}"
 git -C "${SUBMODULE_DIR}" archive --format=tar "${UPSTREAM_COMMIT}" | tar -x -C "${SRC_DIR}"
 
+# build/src usually lives INSIDE this repository's work tree. "git apply" run from a subdirectory of a
+# repository resolves paths against that repository's top level and silently skips non-matching files,
+# so give the exported tree its own throwaway repository before applying anything.
+git -C "${SRC_DIR}" init -q
 PATCH_SET="${PATCH_SET:-all}"
 for p in "${REPO_ROOT}"/patches/*.patch; do
     if [ "${PATCH_SET}" = baseline ]; then
@@ -23,7 +27,14 @@ for p in "${REPO_ROOT}"/patches/*.patch; do
     fi
     log "applying $(basename "$p")"
     (cd "${SRC_DIR}" && git apply --check "$p" && git apply --whitespace=nowarn "$p") || die "patch failed: $p"
+    # verify: every file the patch touches must now contain its added lines
+    for f in $(sed -n 's|^+++ b/||p' "$p"); do
+        first_added=$(awk -v f="$f" '$0=="+++ b/"f{on=1;next} on&&/^\+\+\+ /{on=0} on&&/^\+[^+]/{print substr($0,2); exit}' "$p")
+        [ -n "${first_added}" ] && { grep -qF -- "${first_added}" "${SRC_DIR}/$f" || die "$(basename "$p") did not modify $f"; }
+    done
 done
+
+rm -rf "${SRC_DIR}/.git"
 
 # record provenance for the package
 {

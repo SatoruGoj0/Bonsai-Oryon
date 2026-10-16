@@ -134,7 +134,8 @@ See [docs/OPTIMIZATIONS.md](docs/OPTIMIZATIONS.md) for the full analysis. Summar
    multiply-add chain. A new 2×2 tile (`nrc == 2`) serves prompt processing: each weight vector is
    decoded once and used for two tokens. Batched and single-token results stay bit-identical.
 2. **`0002` NEON `quantize_row_q8_K`.** On ARM this was the scalar reference. The new version is
-   bit-identical to it.
+   bit-identical to it, but it measured no faster on Neoverse N2 (GCC already auto-vectorizes the
+   reference), so it is not a speed claim.
 3. **`0003` `armv8.6_nosve` CPU variant.** Every upstream I8MM variant also requires SVE. Snapdragon
    X has I8MM but no SVE, so it was dispatched to `armv8.2_2` and lost the I8MM kernels for
    non-PQ2_0 tensors (Q8_0/Q4_K repacks).
