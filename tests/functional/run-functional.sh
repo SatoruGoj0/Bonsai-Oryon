@@ -4,7 +4,7 @@
 # <bindir> holds bonsai-cli/bonsai-server/bonsai-bench (installed package: /usr/bin) or the
 # llama-* names of a build tree (then set BONSAI_BACKEND_DIR to the build's bin dir).
 set -uo pipefail
-BIN="$1"; MODEL="$(realpath "$2")"; RESULTS="${3:-/dev/null}"
+BIN="$(realpath "$1")"; MODEL="$(realpath "$2")"; RESULTS="${3:-/dev/null}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 pick() { if [ -x "$BIN/bonsai-$1" ]; then echo "$BIN/bonsai-$1"; else echo "$BIN/llama-$1"; fi; }
 CLI=$(pick cli); SERVER=$(pick server); BENCH=$(pick bench)
