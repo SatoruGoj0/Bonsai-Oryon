@@ -1,3 +1,11 @@
+bonsai-oryon (0.2.0) experimental; urgency=low
+
+  * 0005: 4-row interleaved PQ2_0 layout (CPU_REPACK) for single-token decoding.
+  * 0006: opt-in lossless ternary 4-row layout (BONSAI_PQ2_TERNARY=1, 1.75 bpw).
+  * Add /usr/lib/bonsai-oryon/bin/bonsai-diag; extended benchmark script.
+
+ -- SatoruGoj0 <SatoruGoj0@users.noreply.github.com>  Fri, 16 Oct 2026 18:00:00 +0000
+
 bonsai-oryon (0.1.0) experimental; urgency=low
 
   * Initial release: PrismML llama.cpp e3de715 + Bonsai-Oryon patches 0001-0004.

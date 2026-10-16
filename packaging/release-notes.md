@@ -1,68 +1,64 @@
-# Bonsai Oryon v0.1.0: ARM64 CPU inference (experimental)
+# Bonsai Oryon v0.2.0: ARM64 CPU inference (experimental)
 
-CPU-only ARM64 build of the [PrismML llama.cpp fork](https://github.com/PrismML-Eng/llama.cpp) (`prism` @ `e3de715`), with AArch64 kernels tuned for **Ternary-Bonsai-2-9B PQ2_0**. Packaged for **Debian 13 (trixie) arm64**.
+CPU-only ARM64 build of the [PrismML llama.cpp fork](https://github.com/PrismML-Eng/llama.cpp) (`prism` @ `e3de715`) with AArch64 kernels for **Ternary-Bonsai-2-9B PQ2_0**, packaged for **Debian 13 (trixie) arm64**. This release focuses on single-token decoding (tg).
 
-> **Experimental.** This build passed functional and numerical validation on generic ARM64 CI runners. Nobody has measured its performance on Snapdragon X yet. Please run the bundled benchmark on your machine (see below). The release is marked *pre-release* for that reason.
+> **Experimental, not yet measured on Snapdragon X.** Functional and numerical validation passed on generic ARM64 CI runners (Arm Neoverse N2). Every v0.2 performance number below comes from those runners. They do **not** predict Snapdragon X results (v0.1.0 already behaved very differently there), so please run the benchmark commands below on the laptop.
 
-## Install
-
-```bash
-sha256sum -c bonsai-oryon_0.1.0_arm64.deb.sha256
-sudo apt install ./bonsai-oryon_0.1.0_arm64.deb
-```
-
-## Run
+## Install / upgrade
 
 ```bash
-bonsai-cli    -m ~/bonsai-models/Ternary-Bonsai-2-9B-PQ2_0.gguf -t 8 -ngl 0 -c 4096
-bonsai-server -m ~/bonsai-models/Ternary-Bonsai-2-9B-PQ2_0.gguf --alias bonsai-9b \
-              --host 127.0.0.1 --port 8080 -t 8 -ngl 0 -c 8192
-# OpenAI-compatible API: http://127.0.0.1:8080/v1  (model: bonsai-9b)
+sha256sum -c bonsai-oryon_0.2.0_arm64.deb.sha256
+sudo apt install ./bonsai-oryon_0.2.0_arm64.deb          # upgrades 0.1.0 in place
 ```
 
-## Measure on your laptop
+Roll back to 0.1.0 (still available from the [v0.1.0 release](https://github.com/SatoruGoj0/Bonsai-Oryon/releases/tag/v0.1.0)):
 
 ```bash
-/usr/share/bonsai-oryon/bonsai-benchmark.sh --sweep -b <path to your current llama-bench>
-/usr/share/bonsai-oryon/compare-output.sh <path to your current llama-perplexity>
+sudo apt install --allow-downgrades ./bonsai-oryon_0.1.0_arm64.deb     # or: sudo apt remove bonsai-oryon
 ```
 
-## Rollback
+## Measure on the laptop (exact commands)
 
 ```bash
-sudo apt remove bonsai-oryon     # your existing llama.cpp build is untouched
+# full run, about 20 min, all at -ngl 0, pp256 + tg128, -r 3, same model file:
+/usr/share/bonsai-oryon/bonsai-benchmark.sh -b <path to your previous llama-bench>
+# or step by step:
+/usr/lib/bonsai-oryon/bin/bonsai-diag                                                  # bandwidth vs GEMV
+bonsai-bench -m ~/bonsai-models/Ternary-Bonsai-2-9B-PQ2_0.gguf -ngl 0 -t 4,6,7,8 -p 256 -n 128 -r 3
+BONSAI_PQ2_REPACK=0  bonsai-bench -m ~/bonsai-models/Ternary-Bonsai-2-9B-PQ2_0.gguf -ngl 0 -t 8 -p 256 -n 128 -r 3   # v0.1 path
+BONSAI_PQ2_TERNARY=1 bonsai-bench -m ~/bonsai-models/Ternary-Bonsai-2-9B-PQ2_0.gguf -ngl 0 -t 8 -p 256 -n 128 -r 3   # ternary layout
 ```
 
-## Measured results (CI hardware, not Snapdragon X)
+## What's new
 
-Real model, `Ternary-Bonsai-2-9B-PQ2_0.gguf` (arch `qwen35`, 8.95 B params, every weight tensor PQ2_0
-including the 248k-vocabulary embedding and output head). GitHub `ubuntu-24.04-arm` runner: Arm
-Neoverse N2, 4 vCPU, `-t 4 -ngl 0 -p 256 -n 128 -r 3`, same machine, same CPU module (`armv8.6_2`),
-run back to back
-([model-validation run](https://github.com/SatoruGoj0/Bonsai-Oryon/actions/runs/38889641006)):
+- **`0005` 4-row interleaved PQ2_0 layout (default).** It is repacked at load time and the GGUF is unchanged. For single-token decoding, 4 rows share the activation loads, the row sums are reduced in vector lanes, codes decode in 4 ops per 16 bytes instead of 6, and each thread reads one contiguous weight stream. Prompt processing uses a 4×2 tile. Batched and single-token results are bit-identical.
+- **`0006` lossless ternary layout (opt-in, `BONSAI_PQ2_TERNARY=1`).** The checkpoint turned out to be strictly ternary (no +2 codes), so it can be streamed at 1.75 bpw instead of 2.125, 17.6% fewer bytes per token. Decoding costs more, so this only helps where decoding is memory-bound.
+- **`bonsai-diag`.** Compares DRAM bandwidth with tg-shaped GEMV throughput per thread count, which shows whether this machine is memory- or compute-bound.
+- **Benchmark script.** Runs the diagnostics, a thread sweep, layout A/B, OpenMP placement variants, a comparison against your previous build, and records cpufreq/devfreq/thermal state.
+- **I8MM evaluation.** I8MM was evaluated for single-token decoding and not used: with one activation column, half of every SMMLA result is wasted, so it does no better than SDOT.
 
-| build | pp256 tok/s | tg128 tok/s |
+## Measured on CI hardware (Neoverse N2, 4 vCPU, real 9B model; not Snapdragon X)
+
+| build (Neoverse N2 runner, real 9B model, `-r 3`) | pp256 t=4 | tg128 t=1 | tg128 t=2 | tg128 t=4 |
+|---|---|---|---|---|
+| upstream kernels (e3de715 + 0003/0004) | 8.98 | 1.91 | 3.65 | 6.92 |
+| v0.1 path (`BONSAI_PQ2_REPACK=0`) | 13.91 | 2.22 | 4.21 | 8.04 |
+| **v0.2 4-row layout (default)** | **18.44** | **3.01** | **5.74** | **10.47** |
+| v0.2 ternary layout (`BONSAI_PQ2_TERNARY=1`) | 11.88 | 1.83 | 3.56 | 6.81 |
+
+Output compatibility against the unpatched kernels on the real model: mean KL divergence 0.000000 (max 5e-5), same top-1 token 100%, PPL 10.537824 vs 10.537794 (both 4-row layouts).
+
+| Snapdragon X, 8 threads (user measurements) | pp256 tok/s | tg128 tok/s |
 |---|---|---|
-| pinned upstream kernels (patches 0003+0004 only) | 8.95 ± 0.01 | 6.73 ± 0.06 |
-| Bonsai Oryon (all patches) | **13.80 ± 0.01** (+54%) | **7.82 ± 0.01** (+16%) |
-
-Output compatibility on the same model, full-vocabulary logits against the unpatched kernels over
-1024 tokens: mean KL divergence 5.2e-4 (threshold 1e-3), PPL ratio 1.0018 ± 0.0020, same top-1 token
-98.6%.
-
-These numbers come from a 4-vCPU server core with two 128-bit SIMD pipes. **They do not predict
-Snapdragon X results.** Nobody has measured the package on Snapdragon X yet, so whether it beats the
-5.02 tok/s tg128 baseline there is still open. Run `bonsai-benchmark.sh` on the laptop to find out.
-
-## What's inside
-
-- `0001` NEON PQ2_0×Q8_K kernel: de-interleaved decode, offset folded out through the Q8_K bsums, a 2×2 tile for prompt processing. Batched and single-token results are bit-identical.
-- `0002` NEON `quantize_row_q8_K`, bit-identical to the reference, 1.26× faster on Neoverse N2.
-- `0003` `armv8.6_nosve` CPU variant. Snapdragon X has I8MM but no SVE; it now gets the I8MM kernels.
-- `0004` backends load only from `/usr/lib/bonsai-oryon`, never from the CWD.
-
-Full details are in [docs/OPTIMIZATIONS.md](https://github.com/SatoruGoj0/Bonsai-Oryon/blob/claude/wonderful-curie-my0ukq/docs/OPTIMIZATIONS.md).
+| PrismML e3de715 | 15.57 ± 3.02 | 5.02 ± 0.71 |
+| Bonsai Oryon v0.1.0 | 34.82 ± 4.19 | 6.01 ± 0.57 |
+| Bonsai Oryon v0.2.0 | not measured | not measured |
 
 ## Known limitations
 
-CPU only (no Vulkan). No embedded web UI. No HTTPS model download. Model weights are not included. Not yet benchmarked on Snapdragon X.
+- Not measured on Snapdragon X. Whether tg exceeds 7 tok/s there is unknown until the laptop benchmark is run.
+- On Oryon, v0.1.0's pattern (fast pp, slow tg) suggests tg may be limited by memory bandwidth or synchronization rather than the kernel. In that case the default 4-row layout helps less than on N2, and `BONSAI_PQ2_TERNARY=1` may be the better choice. `bonsai-diag` tells which case applies.
+- The 4-row layout copies the weights into anonymous memory at load time, and loading takes longer.
+- CPU only (no Vulkan, no MTP). No embedded web UI. No HTTPS model download. Model weights are not included.
+
+Full details are in [docs/OPTIMIZATIONS.md](https://github.com/SatoruGoj0/Bonsai-Oryon/blob/claude/wonderful-curie-my0ukq/docs/OPTIMIZATIONS.md).
